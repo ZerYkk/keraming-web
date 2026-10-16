@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Keraming Trenčín</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <header>
+    <div class="header-inner">
+      <div class="brand" onclick="switchMainTab('competitions')">
+        <div class="brand-logo">KT</div>
+        <div>
+          <span class="brand-title">Keraming Trenčín</span>
+          <span class="brand-sub">Prepojené so stolnytenis.info</span>
+        </div>
+      </div>
+
+      <nav class="nav-links">
+        <button id="nav-competitions" class="nav-btn active" onclick="switchMainTab('competitions')">Súťaže & Zápasy</button>
+        <button id="nav-signup" class="nav-btn" onclick="switchMainTab('signup')">Prihlasovanie na zápasy</button>
+        <button id="nav-leaderboard" class="nav-btn" onclick="switchMainTab('leaderboard')">Rebríček klubu</button>
+        <button id="nav-profile" class="nav-btn" onclick="openMyProfile()">Môj profil</button>
+      </nav>
+
+      <div>
+        <select id="user-switcher" class="user-select" onchange="changeUser(this.value)">
+          <option value="guest">🔒 Neprihlásený návštevník</option>
+        </select>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- 1. SÚŤAŽE & ZÁPASY -->
+    <section id="tab-competitions">
+      <div id="team-selector" class="team-tabs"></div>
+
+      <div class="section-header">
+        <div>
+          <div class="section-title" id="comp-title">Muži A – Extraliga</div>
+          <div class="section-sub" id="comp-subtitle">Koeficient súťaže: ×2.50</div>
+        </div>
+      </div>
+
+      <div id="matches-container" class="match-list"></div>
+    </section>
+
+    <!-- 2. PRIHLASOVANIE NA ZÁPASY -->
+    <section id="tab-signup" class="hidden">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Prihlasovanie na víkendové zápasy</div>
+          <div class="section-sub">Zaškrtni, či môžeš hrať v sobotu doobeda a/alebo poobede, a vyber si ligu zo svojej súpisky.</div>
+        </div>
+      </div>
+
+      <div id="my-signup-box" class="my-signup-card"></div>
+
+      <div class="table-card">
+        <table>
+          <thead>
+            <tr>
+              <th>Hráč (Súpiska)</th>
+              <th>Sobota Doobeda</th>
+              <th>Sobota Poobede</th>
+              <th>Chce hrať ligu</th>
+              <th>Auto & Poznámka</th>
+            </tr>
+          </thead>
+          <tbody id="signup-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 3. KLUBOVÝ REBRÍČEK -->
+    <section id="tab-leaderboard" class="hidden">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Klubový rebríček hráčov</div>
+          <div class="section-sub">Zoradené podľa úspešnosti v súťažiach s ohľadom na koeficient náročnosti ligy.</div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Hráč</th>
+              <th>Kmeňová súťaž (Koef.)</th>
+              <th>Dvojhry</th>
+              <th>Úspešnosť</th>
+              <th>K-Index</th>
+            </tr>
+          </thead>
+          <tbody id="leaderboard-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 4. PROFIL HRÁČA -->
+    <section id="tab-profile" class="hidden">
+      <div id="profile-container"></div>
+    </section>
+  </main>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
