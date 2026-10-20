@@ -1,11 +1,11 @@
 const teams = [
-  { id: "A", name: "Muži A", league: "Joola Extraliga", coef: 2.50 },
-  { id: "B", name: "Muži B", league: "2. liga KSTZ TN", coef: 1.80 },
-  { id: "C", name: "Muži C", league: "3. liga KSTZ TN", coef: 1.50 },
+  { id: "A", name: "Muži A", league: "Joola Extraliga", coef: 5 },
+  { id: "B", name: "Muži B", league: "2. liga KSTZ TN", coef: 2 },
+  { id: "C", name: "Muži C", league: "3. liga KSTZ TN", coef: 1.5 },
   { id: "D", name: "Muži D", league: "4. liga KSTZ TN", coef: 1.25 },
-  { id: "E", name: "Muži E", league: "5. liga OSTZ TN", coef: 1.00 },
-  { id: "F", name: "Muži F", league: "5. liga OSTZ TN", coef: 1.00 },
-  { id: "G", name: "Muži G", league: "6. liga OSTZ TN", coef: 0.85 }
+  { id: "E", name: "Muži E", league: "5. liga OSTZ TN", coef: 0.9 },
+  { id: "F", name: "Muži F", league: "5. liga OSTZ TN", coef: 0.9 },
+  { id: "G", name: "Muži G", league: "6. liga OSTZ TN", coef: 0.75 }
 ];
 
 let matches = [];
@@ -36,7 +36,7 @@ async function loadData() {
     console.error("Chyba pri načítaní dát:", e);
   }
 
-  updateNavigation();
+  syncTabFromUrl(false);
   renderAll();
 }
 
@@ -79,10 +79,47 @@ function updateNavigation() {
   });
 }
 
-function switchMainTab(tab) {
+// Mapa medzi interným názvom tabu a URL cestou
+const TAB_ROUTES = {
+  competitions: "/zapasy",
+  signup: "/prihlasovanie",
+  leaderboard: "/rebricek",
+  profile: "/profil"
+};
+
+const ROUTE_TABS = {
+  "/": "competitions",
+  "/zapasy": "competitions",
+  "/prihlasovanie": "signup",
+  "/rebricek": "leaderboard",
+  "/profil": "profile"
+};
+
+function switchMainTab(tab, updateUrl = true) {
   activeMainTab = tab;
   updateNavigation();
   renderAll();
+
+  // Zmení URL adresu v riadku prehliadača bez obnovenia stránky
+  if (updateUrl && TAB_ROUTES[tab]) {
+    window.history.pushState({ tab: tab }, "", TAB_ROUTES[tab]);
+  }
+}
+
+// Keď používateľ klikne na šípku "Späť" alebo "Dopredu" v prehliadači
+window.addEventListener("popstate", (event) => {
+  if (event.state && event.state.tab) {
+    switchMainTab(event.state.tab, false);
+  } else {
+    syncTabFromUrl(false);
+  }
+});
+
+// Zistí tab podľa aktuálnej URL adresy pri prvom otvorení
+function syncTabFromUrl(updateUrl = false) {
+  const path = window.location.pathname;
+  const tab = ROUTE_TABS[path] || "competitions";
+  switchMainTab(tab, updateUrl);
 }
 
 function selectTeam(teamId) {

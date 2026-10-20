@@ -1,17 +1,52 @@
 import sqlite3
 from typing import List
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from fastapi.staticfiles import StaticFiles
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from scraper import sync_from_stolnytenis
 
-app = FastAPI(title="Keraming Trenčín")
+DB_FILE = "keraming.db"
+
+# Plánovač na pozadí
+scheduler = BackgroundScheduler()
+
+def auto_sync_task():
+    print("[AUTOSYNC] Spúšťam pravidelnú synchronizáciu so stolnytenis.info...")
+    try:
+        players, matches = sync_from_stolnytenis(DB_FILE)
+        print(f"[AUTOSYNC] Úspešne synchronizované: {matches} zápasov, {players} hráčov.")
+    except Exception as e:
+        print(f"[AUTOSYNC CHYBA]: {e}")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Inicializácia databázy
+    init_db()
+    
+    # 2. Prvá synchronizácia hneď po štarte (ak je databáza prázdna alebo nová)
+    # Spustíme ju v plánovači, aby neblokovala rýchly štart servera
+    scheduler.add_job(auto_sync_task, id="startup_sync")
+    
+    # 3. Pravidelná synchronizácia každých 6 hodín
+    scheduler.add_job(auto_sync_task, 'interval', hours=6, id="interval_sync")
+    scheduler.start()
+    print("[LIFESPAN] Plánovač spustený: synchronizácia každých 6 hodín.")
+    
+    yield
+    
+    # Vypnutie plánovača pri zastavení aplikácie
+    scheduler.shutdown()
+    print("[LIFESPAN] Plánovač bezpečne vypnutý.")
+
+app = FastAPI(title="Keraming Trenčín", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
-DB_FILE = "keraming.db"
 
 
 def get_db():
@@ -74,12 +109,12 @@ def init_db():
     conn.close()
 
 
-@app.on_event("startup")
-def startup_event():
-    init_db()
-
-
+# Routy pre frontend
 @app.get("/", response_class=HTMLResponse)
+@app.get("/zapasy", response_class=HTMLResponse)
+@app.get("/prihlasovanie", response_class=HTMLResponse)
+@app.get("/rebricek", response_class=HTMLResponse)
+@app.get("/profil", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
 
@@ -145,7 +180,6 @@ def get_matches():
     ]
 
 
-# Endpoint na načítanie úspešnosti súperových hráčov pre konkrétny zápas
 @app.get("/api/matches/{match_id}/opponents")
 def get_match_opponents(match_id: int):
     conn = get_db()
@@ -154,10 +188,8 @@ def get_match_opponents(match_id: int):
         conn.close()
         raise HTTPException(status_code=404, detail="Zápas sa nenašiel")
 
-    # Zistíme, kto je súper
     opp_team_name = match["away_team"] if match["is_home"] else match["home_team"]
 
-    # Hľadáme hráčov súperovho klubu v rovnakej lige
     rows = conn.execute("""
         SELECT player_name, won, lost, club_name
         FROM league_players
