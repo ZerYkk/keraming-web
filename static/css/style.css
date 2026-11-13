@@ -117,6 +117,16 @@ main { max-width: 960px; margin: 24px auto 0; padding: 0 16px; }
 .player-stat-row:last-child { border-bottom: none; }
 .player-link { font-weight: 600; text-decoration: underline; text-decoration-color: #d4d4d8; cursor: pointer; }
 .player-link:hover { color: #ca8a04; }
+.external-profile-link {
+  display: inline-block;
+  margin-top: 6px;
+  color: #52525b;
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: #d4d4d8;
+}
+.external-profile-link:hover { color: #ca8a04; }
 
 .my-signup-card {
   background: var(--surface); border: 2px solid var(--dark);
@@ -168,3 +178,15 @@ tr.me-row { background: #fefce8; }
 .yes-badge { background: var(--green-bg); color: var(--green); font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 5px; }
 .no-badge { background: #f4f4f5; color: #a1a1aa; font-size: 11px; padding: 3px 8px; border-radius: 5px; }
 .cannot-badge { background: var(--red-bg); color: var(--red); font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 5px; }
+.profile-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.profile-kpi-card {
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}

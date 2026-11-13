@@ -37,7 +37,6 @@ LEAGUES = {
 
 def ensure_tables(conn):
     c = conn.cursor()
-    # Hráči Keramingu (pre prihlasovanie a rebríček)
     c.execute("""
         CREATE TABLE IF NOT EXISTS players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,11 +51,14 @@ def ensure_tables(conn):
             cannot_play INTEGER DEFAULT 0,
             selected_leagues TEXT DEFAULT '',
             takes_car INTEGER DEFAULT 0,
-            note TEXT DEFAULT ''
+            note TEXT DEFAULT '',
+            stolnytenis_player_id TEXT
         )
     """)
+    player_columns = {row[1] for row in c.execute("PRAGMA table_info(players)")}
+    if "stolnytenis_player_id" not in player_columns:
+        c.execute("ALTER TABLE players ADD COLUMN stolnytenis_player_id TEXT")
 
-    # Zápasy
     c.execute("""
         CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -73,19 +75,91 @@ def ensure_tables(conn):
         )
     """)
 
-    # Všetci hráči v ligách (pre zobrazenie úspešnosti súperov)
     c.execute("""
         CREATE TABLE IF NOT EXISTS league_players (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             league_id TEXT NOT NULL,
             club_name TEXT NOT NULL,
             player_name TEXT NOT NULL,
+            encounters INTEGER DEFAULT 0,
             won INTEGER DEFAULT 0,
             lost INTEGER DEFAULT 0,
             UNIQUE(league_id, club_name, player_name)
         )
     """)
+
+    try:
+        c.execute("ALTER TABLE league_players ADD COLUMN encounters INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
+
+
+def extract_stat_col(card, col_class: str, label_prefix: str = "") -> int:
+    """
+    Vytiahne číselnú hodnotu priamo zo stĺpca (napr. gridc__c2 = Stret., gridc__c4 = Výhry, gridc__c5 = Prehry).
+    Ak sa trieda nenájde, hľadá podľa prefixu v grd__label.
+    """
+    col = card.find("div", class_=col_class)
+    if col:
+        val_span = col.find("span", class_="grd__value")
+        if val_span:
+            txt = val_span.get_text(strip=True).replace("%", "").strip()
+            try:
+                return int(float(txt))
+            except ValueError:
+                pass
+
+    if label_prefix:
+        for c in card.find_all("div", class_=re.compile(r"gridc__c\d")):
+            lbl = c.find("span", class_="grd__label")
+            if lbl and label_prefix.lower() in lbl.get_text(strip=True).lower():
+                val_span = c.find("span", class_="grd__value")
+                if val_span:
+                    txt = val_span.get_text(strip=True).replace("%", "").strip()
+                    try:
+                        return int(float(txt))
+                    except ValueError:
+                        return 0
+    return 0
+
+
+def match_team_belongs(team_id: str, target_name: str, team_str: str) -> bool:
+    """Presne overí, či názov tímu v zápise patrí danému družstvu (A až G)."""
+    t_low = team_str.lower().strip()
+    target_low = target_name.lower().strip()
+    if team_id == "A":
+        # Tím A nemá na konci písmeno B..G
+        return "keraming" in t_low and not re.search(r"\b[b-g]\s*$", t_low)
+    return target_low in t_low or bool(re.search(rf"keraming.*\b{team_id.lower()}\s*$", t_low))
+
+
+def extract_stolnytenis_player_id(card):
+    profile_link = card.select_one('a[href*="/hrac/"]')
+    profile_href = profile_link.get("href", "") if profile_link else ""
+    profile_id_match = re.search(r"/hrac/(\d+)/?$", profile_href)
+    return profile_id_match.group(1) if profile_id_match else None
+
+
+def extract_match_schedule(match_div):
+    match_group = match_div.find_parent("div", class_="mb-3")
+    round_header = match_group.select_one(".mtchrnd__num") if match_group else None
+    round_str = round_header.get_text(" ", strip=True) if round_header else "Kolo neurčené"
+
+    date_span = match_div.select_one(".mtchr__round__date, .mtchr__more__round__date")
+    source_datetime = date_span.get_text(" ", strip=True) if date_span else ""
+    time_match = re.search(r"\b(?:[01]?\d|2[0-3]):[0-5]\d\b", source_datetime)
+    if time_match:
+        match_date = " ".join(
+            (source_datetime[:time_match.start()] + source_datetime[time_match.end():]).split()
+        )
+        match_time = time_match.group(0)
+    else:
+        match_date = source_datetime
+        match_time = "Čas neurčený"
+
+    return round_str, match_date, match_time
 
 
 def sync_from_stolnytenis(db_file: str):
@@ -93,6 +167,13 @@ def sync_from_stolnytenis(db_file: str):
     conn.row_factory = sqlite3.Row
     ensure_tables(conn)
     cursor = conn.cursor()
+
+    # Vyčistíme tabuľku ligových štatistík a staré zápasy pred čerstvým sťahovaním,
+    # aby nevznikali duplicity z predchádzajúcich behov.
+    cursor.execute("DELETE FROM league_players")
+    cursor.execute("DELETE FROM matches")
+    cursor.execute("UPDATE players SET won = 0, lost = 0")
+    conn.commit()
 
     synced_matches = 0
     synced_club_players = 0
@@ -103,44 +184,46 @@ def sync_from_stolnytenis(db_file: str):
     }
 
     with httpx.Client(timeout=15.0, follow_redirects=True, headers=headers) as client:
+        # 1. ROZPIS ZÁPASOV
         for team_id, info in LEAGUES.items():
             base_url = info["url"].rstrip("/")
             target_team = info["match_name"]
 
-            # 1. ROZPIS ZÁPASOV
             try:
                 resp = client.get(f"{base_url}/rozpis")
                 if resp.status_code == 200:
                     soup = BeautifulSoup(resp.text, "html.parser")
                     for m_div in soup.find_all("div", class_=re.compile("mtchr row")):
-                        match_id = m_div.get("data-match_id")
-                        date_span = m_div.find("span", class_="mtchr__round__date")
-                        match_date_str = date_span.get_text(strip=True) if date_span else ""
+                        raw_match_id = m_div.get("data-match_id") or ""
+                        ext_id = f"{team_id}_{raw_match_id}"
 
-                        num_div = m_div.find("div", class_="mtchr__num")
-                        round_str = f"{num_div.get_text(strip=True)} kolo" if num_div else "1. kolo"
+                        round_str, match_date_str, slot = extract_match_schedule(m_div)
 
                         home_a = m_div.find("a", class_="mtchr__home")
                         away_a = m_div.find("a", class_="mtchr__away")
                         home_name = home_a.get_text(strip=True) if home_a else ""
                         away_name = away_a.get_text(strip=True) if away_a else ""
 
-                        if target_team.lower() not in home_name.lower() and target_team.lower() not in away_name.lower():
+                        is_home = match_team_belongs(team_id, target_team, home_name)
+                        is_away = match_team_belongs(team_id, target_team, away_name)
+                        if not is_home and not is_away:
                             continue
 
-                        is_home = target_team.lower() in home_name.lower()
                         home_score = m_div.find("a", class_="mtchr__home__score")
                         away_score = m_div.find("a", class_="mtchr__away__score")
 
                         status = "upcoming"
                         score_str = None
                         if home_score and away_score:
-                            score_str = f"{home_score.get_text(strip=True)} : {away_score.get_text(strip=True)}"
-                            status = "played"
-
-                        slot = "Doobeda (10:00)"
-                        if any(h in match_date_str for h in ["13:", "14:", "15:", "16:", "17:", "18:"]):
-                            slot = "Poobede (14:00+)"
+                            h_txt = home_score.get_text(strip=True)
+                            a_txt = away_score.get_text(strip=True)
+                            # Zápas je odohraný iba vtedy, ak obsahuje reálne číselné skóre a nejde o neodohraný zápas (0:0 bez výsledku)
+                            if h_txt.isdigit() and a_txt.isdigit():
+                                div_classes = m_div.get("class", [])
+                                has_result_class = any(c in div_classes for c in ["mtchr__win", "mtchr__lose", "mtchr__draw"])
+                                if (h_txt != "0" or a_txt != "0") or has_result_class:
+                                    score_str = f"{h_txt} : {a_txt}"
+                                    status = "played"
 
                         cursor.execute("""
                             INSERT INTO matches (external_id, team_id, round, match_date, slot, home_team, away_team, is_home, status, score)
@@ -149,70 +232,113 @@ def sync_from_stolnytenis(db_file: str):
                                 status=excluded.status,
                                 score=excluded.score
                         """, (
-                            match_id, team_id, round_str, match_date_str, slot,
+                            ext_id, team_id, round_str, match_date_str, slot,
                             home_name, away_name, 1 if is_home else 0, status, score_str
                         ))
                         synced_matches += 1
             except Exception as e:
                 print(f"Chyba rozpisu {team_id}: {e}")
 
-            # 2. ÚSPEŠNOSŤ VŠETKÝCH HRÁČOV V LIGE (Keraming + Súperi)
+        # 2. ÚSPEŠNOSŤ PODĽA SÚŤAŽÍ (každú unikátnu URL stiahneme iba raz)
+        unique_urls = {}
+        for tid, l_data in LEAGUES.items():
+            u = l_data["url"].rstrip("/")
+            if u not in unique_urls:
+                unique_urls[u] = []
+            unique_urls[u].append(tid)
+
+        player_totals = {}
+
+        for u, team_ids in unique_urls.items():
             try:
-                resp_usp = client.get(f"{base_url}/uspesnost")
-                if resp_usp.status_code == 200:
-                    soup_usp = BeautifulSoup(resp_usp.text, "html.parser")
-                    player_cards = soup_usp.find_all("div", class_=re.compile("gridc_usp"))
+                resp_usp = client.get(f"{u}/uspesnost")
+                if resp_usp.status_code != 200:
+                    continue
 
-                    for card in player_cards:
-                        club_p = card.find("p", class_="trn__avatar__club")
-                        name_p = card.find("p", class_="trn__avatar__name")
-                        if not club_p or not name_p:
-                            continue
+                soup_usp = BeautifulSoup(resp_usp.text, "html.parser")
+                player_cards = soup_usp.select("div.gridc.gridc_usp")
 
-                        club_name = club_p.get_text(strip=True)
-                        player_name = name_p.get_text(strip=True)
+                for card in player_cards:
+                    club_p = card.find("p", class_="trn__avatar__club")
+                    name_p = card.find("p", class_="trn__avatar__name")
+                    if not club_p or not name_p:
+                        continue
 
-                        c4 = card.find("div", class_="gridc__c4")
-                        c5 = card.find("div", class_="gridc__c5")
+                    club_name = club_p.get_text(strip=True)
+                    player_name = name_p.get_text(strip=True)
+                    stolnytenis_player_id = extract_stolnytenis_player_id(card)
 
-                        won_val = int(c4.find("span", class_="grd__value").get_text(strip=True)) if c4 and c4.find("span", class_="grd__value") else 0
-                        lost_val = int(c5.find("span", class_="grd__value").get_text(strip=True)) if c5 and c5.find("span", class_="grd__value") else 0
+                    # gridc__c2 = Stretnutia, gridc__c4 = Výhry, gridc__c5 = Prehry
+                    encounters_val = extract_stat_col(card, "gridc__c2", "stret")
+                    won_val = extract_stat_col(card, "gridc__c4", "výh")
+                    lost_val = extract_stat_col(card, "gridc__c5", "preh")
 
-                        # A) Uložíme do zoznamu hráčov celej ligy (pre súperov)
+                    matched_tids = []
+                    if "keraming" in club_name.lower():
+                        for tid in team_ids:
+                            if match_team_belongs(tid, LEAGUES[tid]["match_name"], club_name):
+                                matched_tids.append(tid)
+                        if not matched_tids:
+                            matched_tids = [team_ids[0]]
+                    else:
+                        matched_tids = team_ids
+
+                    for tid in matched_tids:
                         cursor.execute("""
-                            INSERT INTO league_players (league_id, club_name, player_name, won, lost)
-                            VALUES (?, ?, ?, ?, ?)
+                            INSERT INTO league_players (league_id, club_name, player_name, encounters, won, lost)
+                            VALUES (?, ?, ?, ?, ?, ?)
                             ON CONFLICT(league_id, club_name, player_name) DO UPDATE SET
+                                encounters=excluded.encounters,
                                 won=excluded.won,
                                 lost=excluded.lost
-                        """, (team_id, club_name, player_name, won_val, lost_val))
+                        """, (tid, club_name, player_name, encounters_val, won_val, lost_val))
                         synced_opponents += 1
 
-                        # B) Ak je to náš hráč Keramingu, aktualizujeme aj internú tabuľku players
-                        if "keraming" in club_name.lower():
-                            existing = cursor.execute("SELECT roster, won, lost FROM players WHERE name = ?", (player_name,)).fetchone()
-                            if not existing:
-                                cursor.execute("""
-                                    INSERT INTO players (name, primary_team, roster, won, lost)
-                                    VALUES (?, ?, ?, ?, ?)
-                                """, (player_name, team_id, team_id, won_val, lost_val))
-                            else:
-                                rosters = [x.strip() for x in existing["roster"].split(",") if x.strip()]
-                                if team_id not in rosters:
-                                    rosters.append(team_id)
-                                total_won = existing["won"] + won_val
-                                total_lost = existing["lost"] + lost_val
-                                cursor.execute("""
-                                    UPDATE players SET roster = ?, won = ?, lost = ? WHERE name = ?
-                                """, (",".join(rosters), total_won, total_lost, player_name))
-                            synced_club_players += 1
+                    if "keraming" in club_name.lower():
+                        if player_name not in player_totals:
+                            player_totals[player_name] = {
+                                "primary_team": matched_tids[0],
+                                "rosters": set(matched_tids),
+                                "won": won_val,
+                                "lost": lost_val,
+                                "stolnytenis_player_id": stolnytenis_player_id
+                            }
+                        else:
+                            player_totals[player_name]["rosters"].update(matched_tids)
+                            player_totals[player_name]["won"] += won_val
+                            player_totals[player_name]["lost"] += lost_val
+                            if stolnytenis_player_id:
+                                player_totals[player_name]["stolnytenis_player_id"] = stolnytenis_player_id
 
             except Exception as e:
-                print(f"Chyba úspešnosti {team_id}: {e}")
+                print(f"Chyba úspešnosti {u}: {e}")
+
+        for p_name, p_data in player_totals.items():
+            roster_str = ",".join(sorted(list(p_data["rosters"])))
+            existing = cursor.execute("SELECT id FROM players WHERE name = ?", (p_name,)).fetchone()
+            if not existing:
+                cursor.execute("""
+                    INSERT INTO players (name, primary_team, roster, won, lost, stolnytenis_player_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    p_name, p_data["primary_team"], roster_str, p_data["won"], p_data["lost"],
+                    p_data["stolnytenis_player_id"]
+                ))
+            else:
+                cursor.execute("""
+                    UPDATE players
+                    SET primary_team = ?, roster = ?, won = ?, lost = ?,
+                        stolnytenis_player_id = COALESCE(?, stolnytenis_player_id)
+                    WHERE name = ?
+                """, (
+                    p_data["primary_team"], roster_str, p_data["won"], p_data["lost"],
+                    p_data["stolnytenis_player_id"], p_name
+                ))
+            synced_club_players += 1
 
     conn.commit()
     conn.close()
-    print(f"Úspešne synchronizované: {synced_matches} zápasov, {synced_club_players} našich hráčov a {synced_opponents} hráčov súperov.")
+    print(f"Úspešne synchronizované: {synced_matches} zápasov, {synced_club_players} našich hráčov a {synced_opponents} záznamov v ligách.")
     return synced_club_players, synced_matches
 
 
