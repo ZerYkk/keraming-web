@@ -43,9 +43,10 @@ header {
 }
 .brand { display: flex; align-items: center; gap: 10px; cursor: pointer; }
 .brand-logo {
-  width: 36px; height: 36px; border-radius: 8px;
-  background: var(--yellow); color: var(--dark);
-  font-weight: 900; display: flex; align-items: center; justify-content: center;
+  width: 52px;
+  height: 52px;
+  object-fit: contain;
+  flex: 0 0 auto;
 }
 .brand-title { font-weight: 700; font-size: 16px; }
 .brand-sub { font-size: 11px; color: #a1a1aa; display: block; }
@@ -59,10 +60,56 @@ header {
 .nav-btn:hover { color: #fff; background: #27272a; }
 .nav-btn.active { background: var(--yellow); color: var(--dark); }
 
-.user-select {
-  background: #18181b; color: #fff; border: 1px solid #3f3f46;
-  padding: 6px 10px; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer;
+.auth-actions { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.auth-user-label { color: #d4d4d8; font-size: 12px; font-weight: 600; }
+.auth-dialog {
+  width: min(420px, calc(100% - 32px));
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  box-shadow: 0 20px 60px #0003;
 }
+.auth-dialog::backdrop { background: #09090bcc; }
+.auth-form { display: flex; flex-direction: column; gap: 14px; padding: 22px; }
+.auth-form h2 { font-size: 20px; }
+.auth-form label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 700; }
+.auth-form input, .account-username-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font: inherit;
+}
+.password-input-wrap { display: flex; align-items: stretch; }
+.password-input-wrap input { min-width: 0; border-radius: 8px 0 0 8px; }
+.password-toggle {
+  border: 1px solid var(--border);
+  border-left: 0;
+  border-radius: 0 8px 8px 0;
+  padding: 0 12px;
+  background: var(--surface-muted);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.password-toggle:hover { background: var(--border); }
+.password-toggle:focus-visible { outline: 2px solid var(--dark); outline-offset: 2px; }
+.auth-form-actions { display: flex; align-items: center; gap: 8px; }
+.auth-message { color: var(--red); font-size: 13px; font-weight: 600; }
+.credential-output {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--yellow);
+  border-radius: 10px;
+  background: var(--yellow-soft);
+  font-size: 13px;
+}
+.credential-output code { font-weight: 800; user-select: all; }
+.account-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 
 main { max-width: 960px; margin: 24px auto 0; padding: 0 16px; }
 .hidden { display: none !important; }

@@ -1,20 +1,35 @@
 import hashlib
+import hmac
+import os
+import secrets
 import sqlite3
 import re
+import sys
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from getpass import getpass
 from typing import List
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from scraper import sync_from_stolnytenis
 
-DB_FILE = "keraming.db"
+DB_FILE = os.getenv("DB_FILE", "keraming.db")
+SESSION_COOKIE = "keraming_session"
+SESSION_DURATION = timedelta(days=14)
+COOKIE_SECURE_OVERRIDE = os.getenv("COOKIE_SECURE")
+USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9._-]{3,32}$")
+PASSWORD_SCRYPT_N = 1 << 14
+PASSWORD_MIN_LENGTH = 8
+TEMP_PASSWORD_LENGTH = 8
+TEMP_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
 
 scheduler = BackgroundScheduler()
 
@@ -113,8 +128,187 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('admin', 'player')),
+            player_id INTEGER UNIQUE REFERENCES players(id),
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS login_sessions (
+            token_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            csrf_token TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username_hash TEXT NOT NULL,
+            remote_address TEXT NOT NULL,
+            attempted_at TEXT NOT NULL
+        )
+    """)
+    login_attempt_columns = {row[1] for row in c.execute("PRAGMA table_info(login_attempts)")}
+    if "remote_address" not in login_attempt_columns:
+        c.execute(
+            "ALTER TABLE login_attempts ADD COLUMN remote_address TEXT NOT NULL DEFAULT ''"
+        )
+
     conn.commit()
     conn.close()
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=PASSWORD_SCRYPT_N,
+        r=8,
+        p=1,
+        dklen=64,
+        maxmem=64 * 1024 * 1024
+    )
+    return f"scrypt${PASSWORD_SCRYPT_N}$8$1${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        scheme, n, r, p, salt_hex, digest_hex = stored_hash.split("$")
+        if (
+            scheme != "scrypt"
+            or int(n) != PASSWORD_SCRYPT_N
+            or int(r) != 8
+            or int(p) != 1
+            or len(bytes.fromhex(digest_hex)) != 64
+        ):
+            return False
+        digest = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=PASSWORD_SCRYPT_N,
+            r=8,
+            p=1,
+            dklen=64,
+            maxmem=64 * 1024 * 1024
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest.hex(), digest_hex)
+
+
+def normalize_username(username: str) -> str:
+    username = username.strip().lower()
+    if not USERNAME_PATTERN.fullmatch(username):
+        raise HTTPException(
+            status_code=422,
+            detail="Prihlasovacie meno musí mať 3–32 znakov: písmená bez diakritiky, čísla, bodku, pomlčku alebo podčiarkovník."
+        )
+    return username
+
+
+def create_session(conn, user_id: int):
+    token = secrets.token_urlsafe(32)
+    csrf_token = secrets.token_urlsafe(32)
+    expires_at = (datetime.now(timezone.utc) + SESSION_DURATION).isoformat()
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO login_sessions (token_hash, user_id, csrf_token, expires_at) VALUES (?, ?, ?, ?)",
+        (token_hash, user_id, csrf_token, expires_at)
+    )
+    return token, csrf_token
+
+
+def generate_temporary_password() -> str:
+    return "".join(secrets.choice(TEMP_PASSWORD_ALPHABET) for _ in range(TEMP_PASSWORD_LENGTH))
+
+
+def session_cookie_is_secure(request: Request) -> bool:
+    if COOKIE_SECURE_OVERRIDE is not None:
+        return COOKIE_SECURE_OVERRIDE.lower() != "false"
+    if request.url.scheme == "https":
+        return True
+    return urlsplit(str(request.url)).hostname not in {"localhost", "127.0.0.1", "::1"}
+
+
+def set_session_cookie(request: Request, response: Response, token: str):
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        max_age=int(SESSION_DURATION.total_seconds()),
+        httponly=True,
+        secure=session_cookie_is_secure(request),
+        samesite="lax",
+        path="/"
+    )
+
+
+def get_optional_user(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn = get_db()
+    user = conn.execute("""
+        SELECT u.*, s.csrf_token
+        FROM login_sessions s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1
+    """, (token_hash, datetime.now(timezone.utc).isoformat())).fetchone()
+    conn.close()
+    return user
+
+
+def require_user(request: Request, *, allow_password_change=False, check_csrf=False):
+    user = get_optional_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Prihláste sa.")
+    if user["must_change_password"] and not allow_password_change:
+        raise HTTPException(status_code=403, detail="Pred pokračovaním si zmeňte dočasné heslo.")
+    if check_csrf and not hmac.compare_digest(
+        request.headers.get("X-CSRF-Token", ""),
+        user["csrf_token"]
+    ):
+        raise HTTPException(status_code=403, detail="Neplatný bezpečnostný token.")
+    return user
+
+
+def require_admin(request: Request):
+    user = require_user(request, check_csrf=request.method not in {"GET", "HEAD", "OPTIONS"})
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Táto operácia je dostupná iba administrátorovi.")
+    return user
+
+
+def create_admin_account(username: str, password: str):
+    try:
+        username = normalize_username(username)
+    except HTTPException as exc:
+        raise ValueError(exc.detail) from exc
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"Heslo musí mať aspoň {PASSWORD_MIN_LENGTH} znakov.")
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')",
+            (username, hash_password(password))
+        )
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("Toto prihlasovacie meno už existuje.") from exc
+    finally:
+        conn.close()
+
+
+DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(24))
 
 
 def get_asset_version():
@@ -125,11 +319,134 @@ def get_asset_version():
     return digest.hexdigest()[:12]
 
 
+class LoginPayload(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class PasswordChangePayload(BaseModel):
+    currentPassword: str = Field(default="", max_length=128)
+    newPassword: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=128)
+
+
+class AccountPayload(BaseModel):
+    playerId: int = Field(gt=0)
+    username: str = Field(min_length=3, max_length=32)
+
+
+class UsernamePayload(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+
+
+def public_user_data(user, csrf_token: str):
+    return {
+        "userId": user["id"],
+        "playerId": user["player_id"],
+        "username": user["username"],
+        "role": user["role"],
+        "mustChangePassword": bool(user["must_change_password"]),
+        "csrfToken": csrf_token
+    }
+
+
+@app.post("/api/auth/login")
+def login(data: LoginPayload, request: Request, response: Response):
+    username = data.username.strip().lower()
+    username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(minutes=15)).isoformat()
+    conn = get_db()
+    conn.execute("DELETE FROM login_attempts WHERE attempted_at <= ?", (cutoff,))
+    attempts = conn.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE username_hash = ? AND attempted_at > ?",
+        (username_hash, cutoff)
+    ).fetchone()[0]
+    if attempts >= 10:
+        conn.close()
+        raise HTTPException(status_code=429, detail="Priveľa neúspešných pokusov. Skúste to o 15 minút.")
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE username = ? AND active = 1",
+        (username,)
+    ).fetchone()
+    valid_password = verify_password(
+        data.password,
+        user["password_hash"] if user else DUMMY_PASSWORD_HASH
+    )
+    if not user or not valid_password:
+        conn.execute(
+            "INSERT INTO login_attempts (username_hash, remote_address, attempted_at) VALUES (?, ?, ?)",
+            (username_hash, request.client.host if request.client else "", now.isoformat())
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=401, detail="Nesprávne prihlasovacie meno alebo heslo.")
+
+    conn.execute("DELETE FROM login_attempts WHERE username_hash = ?", (username_hash,))
+    conn.execute("DELETE FROM login_sessions WHERE expires_at <= ?", (now.isoformat(),))
+    token, csrf_token = create_session(conn, user["id"])
+    conn.commit()
+    conn.close()
+    set_session_cookie(request, response, token)
+    return public_user_data(user, csrf_token)
+
+
+@app.get("/api/auth/me")
+def get_current_session(request: Request):
+    user = get_optional_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Nie ste prihlásený.")
+    return public_user_data(user, user["csrf_token"])
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    user = require_user(request, allow_password_change=True, check_csrf=True)
+    token = request.cookies.get(SESSION_COOKIE, "")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    conn = get_db()
+    conn.execute("DELETE FROM login_sessions WHERE token_hash = ?", (token_hash,))
+    conn.commit()
+    conn.close()
+    response.delete_cookie(
+        SESSION_COOKIE,
+        path="/",
+        secure=session_cookie_is_secure(request),
+        httponly=True,
+        samesite="lax"
+    )
+    return {"ok": True}
+
+
+@app.post("/api/auth/change-password")
+def change_password(data: PasswordChangePayload, request: Request, response: Response):
+    user = require_user(request, allow_password_change=True, check_csrf=True)
+    conn = get_db()
+    stored = conn.execute("SELECT password_hash FROM users WHERE id = ?", (user["id"],)).fetchone()
+    if not user["must_change_password"] and not verify_password(data.currentPassword, stored["password_hash"]):
+        conn.close()
+        raise HTTPException(status_code=400, detail="Súčasné heslo nie je správne.")
+
+    conn.execute(
+        "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+        (hash_password(data.newPassword), user["id"])
+    )
+    conn.execute("DELETE FROM login_sessions WHERE user_id = ?", (user["id"],))
+    token, csrf_token = create_session(conn, user["id"])
+    conn.commit()
+    conn.close()
+    set_session_cookie(request, response, token)
+    user = dict(user)
+    user["must_change_password"] = 0
+    return public_user_data(user, csrf_token)
+
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/zapasy", response_class=HTMLResponse)
 @app.get("/prihlasovanie", response_class=HTMLResponse)
 @app.get("/rebricek", response_class=HTMLResponse)
 @app.get("/profil", response_class=HTMLResponse)
+@app.get("/sprava-uctov", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse(
         request=request,
@@ -139,7 +456,8 @@ def index(request: Request):
 
 
 @app.post("/api/sync")
-def run_sync():
+def run_sync(request: Request):
+    require_admin(request)
     count_players, count_matches = sync_from_stolnytenis(DB_FILE)
     return {
         "ok": True,
@@ -149,7 +467,9 @@ def run_sync():
 
 
 @app.get("/api/players")
-def get_players():
+def get_players(request: Request):
+    user = get_optional_user(request)
+    can_view_signup = user is not None and not user["must_change_password"]
     conn = get_db()
     rows = conn.execute("SELECT * FROM players ORDER BY id").fetchall()
 
@@ -236,7 +556,7 @@ def get_players():
                     "winRate": 0.0
                 })
 
-        result.append({
+        player_data = {
             "id": r["id"],
             "name": pname,
             "teamId": r["primary_team"],
@@ -245,20 +565,117 @@ def get_players():
             "lost": r["lost"],
             "doubles": r["doubles"],
             "leagueStats": league_stats_list,
-            "canMorning": bool(r["can_morning"]),
-            "canAfternoon": bool(r["can_afternoon"]),
-            "cannotPlay": bool(r["cannot_play"]),
-            "selectedLeagues": [x.strip() for x in r["selected_leagues"].split(",") if x.strip()],
-            "takesCar": bool(r["takes_car"]),
             "stolnytenisUrl": (
                 f"https://www.stolnytenis.info/hrac/{r['stolnytenis_player_id']}"
                 if r["stolnytenis_player_id"] and str(r["stolnytenis_player_id"]).isdigit()
                 else None
-            ),
-            "note": r["note"]
-        })
+            )
+        }
+        if can_view_signup:
+            player_data.update({
+                "canMorning": bool(r["can_morning"]),
+                "canAfternoon": bool(r["can_afternoon"]),
+                "cannotPlay": bool(r["cannot_play"]),
+                "selectedLeagues": [x.strip() for x in r["selected_leagues"].split(",") if x.strip()],
+                "takesCar": bool(r["takes_car"]),
+                "note": r["note"]
+            })
+        result.append(player_data)
 
     return result
+
+
+@app.get("/api/admin/accounts")
+def get_accounts(request: Request):
+    require_admin(request)
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT p.id, p.name, p.roster, u.username
+        FROM players p
+        LEFT JOIN users u ON u.player_id = p.id AND u.role = 'player'
+        ORDER BY p.name COLLATE NOCASE
+    """).fetchall()
+    conn.close()
+    return [
+        {
+            "playerId": row["id"],
+            "name": row["name"],
+            "roster": [team.strip() for team in row["roster"].split(",") if team.strip()],
+            "username": row["username"]
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/admin/accounts")
+def create_player_account(data: AccountPayload, request: Request):
+    require_admin(request)
+    username = normalize_username(data.username)
+    temporary_password = generate_temporary_password()
+    conn = get_db()
+    player = conn.execute("SELECT id FROM players WHERE id = ?", (data.playerId,)).fetchone()
+    if not player:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Hráč sa nenašiel.")
+    try:
+        conn.execute("""
+            INSERT INTO users (username, password_hash, role, player_id, must_change_password)
+            VALUES (?, ?, 'player', ?, 1)
+        """, (username, hash_password(temporary_password), data.playerId))
+        username_hash = hashlib.sha256(username.encode("utf-8")).hexdigest()
+        conn.execute("DELETE FROM login_attempts WHERE username_hash = ?", (username_hash,))
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Hráč už má účet alebo prihlasovacie meno už existuje.") from exc
+    conn.close()
+    return {"username": username, "temporaryPassword": temporary_password}
+
+
+@app.put("/api/admin/accounts/{player_id}")
+def update_player_username(player_id: int, data: UsernamePayload, request: Request):
+    require_admin(request)
+    username = normalize_username(data.username)
+    conn = get_db()
+    account = conn.execute(
+        "SELECT id FROM users WHERE player_id = ? AND role = 'player'",
+        (player_id,)
+    ).fetchone()
+    if not account:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Hráč ešte nemá prihlasovací účet.")
+    try:
+        conn.execute("UPDATE users SET username = ? WHERE id = ?", (username, account["id"]))
+        conn.commit()
+    except sqlite3.IntegrityError as exc:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Toto prihlasovacie meno už existuje.") from exc
+    conn.close()
+    return {"ok": True, "username": username}
+
+
+@app.post("/api/admin/accounts/{player_id}/reset-password")
+def reset_player_password(player_id: int, request: Request):
+    require_admin(request)
+    temporary_password = generate_temporary_password()
+    conn = get_db()
+    account = conn.execute(
+        "SELECT id, username FROM users WHERE player_id = ? AND role = 'player'",
+        (player_id,)
+    ).fetchone()
+    if not account:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Hráč ešte nemá prihlasovací účet.")
+    conn.execute("""
+        UPDATE users SET password_hash = ?, must_change_password = 1
+        WHERE id = ?
+    """, (hash_password(temporary_password), account["id"]))
+    conn.execute("DELETE FROM login_sessions WHERE user_id = ?", (account["id"],))
+    username_hash = hashlib.sha256(account["username"].encode("utf-8")).hexdigest()
+    conn.execute("DELETE FROM login_attempts WHERE username_hash = ?", (username_hash,))
+    conn.commit()
+    conn.close()
+    return {"username": account["username"], "temporaryPassword": temporary_password}
 
 
 @app.get("/api/matches")
@@ -324,19 +741,22 @@ def get_match_opponents(match_id: int):
 
 
 class SignupPayload(BaseModel):
-    playerId: int
     canMorning: bool
     canAfternoon: bool
     cannotPlay: bool
     selectedLeagues: List[str]
     takesCar: bool
-    note: str = ""
+    note: str = Field(default="", max_length=500)
 
 
 @app.post("/api/signup")
-def update_signup(data: SignupPayload):
+def update_signup(data: SignupPayload, request: Request):
+    user = require_user(request, check_csrf=True)
+    if user["role"] != "player" or user["player_id"] is None:
+        raise HTTPException(status_code=403, detail="Prihlasovať sa môže iba hráčsky účet.")
+
     conn = get_db()
-    player = conn.execute("SELECT * FROM players WHERE id = ?", (data.playerId,)).fetchone()
+    player = conn.execute("SELECT * FROM players WHERE id = ?", (user["player_id"],)).fetchone()
     if not player:
         conn.close()
         raise HTTPException(status_code=404, detail="Hráč neexistuje")
@@ -356,8 +776,23 @@ def update_signup(data: SignupPayload):
         "" if data.cannotPlay else ",".join(valid_leagues),
         0 if data.cannotPlay else int(data.takesCar),
         data.note.strip(),
-        data.playerId
+        user["player_id"]
     ))
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3 or sys.argv[1] != "create-admin":
+        raise SystemExit("Použitie: python main.py create-admin <používateľské_meno>")
+
+    init_db()
+    first_password = getpass(f"Heslo administrátora (min. {PASSWORD_MIN_LENGTH} znakov): ")
+    if first_password != getpass("Zopakujte heslo: "):
+        raise SystemExit("Heslá sa nezhodujú.")
+    try:
+        create_admin_account(sys.argv[2], first_password)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"Administrátorský účet {sys.argv[2].strip().lower()} bol vytvorený.")

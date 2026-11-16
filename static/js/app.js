@@ -5,14 +5,16 @@ const teams = [
   { id: "D", name: "Muži D", league: "4. liga KSTZ TN", coef: 2 },
   { id: "E", name: "Muži E", league: "5. liga OSTZ TN", coef: 1.00 },
   { id: "F", name: "Muži F", league: "5. liga OSTZ TN", coef: 1.00 },
-  { id: "G", name: "Muži G", league: "6. liga OSTZ TN", coef: 0.85 }
+  { id: "G", name: "Muži G", league: "6. liga OSTZ TN", coef: 0.85 },
+  { id: "H", name: "Ženy", league: "Extraliga", coef: 5 }
 ];
 
 const TAB_ROUTES = {
   competitions: "/zapasy",
   signup: "/prihlasovanie",
   leaderboard: "/rebricek",
-  profile: "/profil"
+  profile: "/profil",
+  admin: "/sprava-uctov"
 };
 
 const ROUTE_TABS = {
@@ -20,13 +22,15 @@ const ROUTE_TABS = {
   "/zapasy": "competitions",
   "/prihlasovanie": "signup",
   "/rebricek": "leaderboard",
-  "/profil": "profile"
+  "/profil": "profile",
+  "/sprava-uctov": "admin"
 };
 
 let matches = [];
 let clubPlayers = [];
 let opponentsCache = {};
-let currentUserId = "guest";
+let currentUser = null;
+let csrfToken = "";
 let activeTeamId = "A";
 let activeMainTab = "competitions";
 let expandedMatchId = null;
@@ -36,14 +40,26 @@ let viewedProfilePlayerId = null;
 let activeProfileLeague = "ALL";
 
 async function loadData() {
+  currentUser = null;
+  csrfToken = "";
   try {
+    const sessionResponse = await fetch("/api/auth/me");
+    if (sessionResponse.ok) {
+      currentUser = await sessionResponse.json();
+    } else if (sessionResponse.status === 401) {
+      currentUser = null;
+    } else {
+      throw new Error(await responseError(sessionResponse));
+    }
+    csrfToken = currentUser ? currentUser.csrfToken : "";
+
     const resMatches = await fetch("/api/matches");
+    if (!resMatches.ok) throw new Error("Nepodarilo sa načítať zápasy.");
     matches = await resMatches.json();
 
     const resPlayers = await fetch("/api/players");
+    if (!resPlayers.ok) throw new Error("Nepodarilo sa načítať hráčov.");
     clubPlayers = await resPlayers.json();
-
-    populateUserSelect();
 
     if (matches.length > 0) {
       const first = matches.find(m => m.teamId === activeTeamId);
@@ -58,46 +74,178 @@ async function loadData() {
 
   syncTabFromUrl(false);
   renderAll();
-}
-
-function populateUserSelect() {
-  const sel = document.getElementById("user-switcher");
-  let html = `<option value="guest">🔒 Neprihlásený návštevník</option>`;
-  clubPlayers.forEach(p => {
-    html += `<option value="${p.id}">👤 ${p.name} (Súpiska: ${p.roster.join(", ")})</option>`;
-  });
-  sel.innerHTML = html;
-  if (clubPlayers.length > 0 && currentUserId === "guest") {
-    currentUserId = clubPlayers[0].id;
-    sel.value = String(currentUserId);
-    viewedProfilePlayerId = currentUserId;
-  }
+  if (currentUser && currentUser.mustChangePassword) openPasswordDialog(true);
 }
 
 function getCurrentPlayer() {
-  if (currentUserId === "guest") return null;
-  return clubPlayers.find(p => p.id === parseInt(currentUserId, 10));
+  if (!currentUser || currentUser.role !== "player" || currentUser.mustChangePassword) return null;
+  return clubPlayers.find(p => p.id === currentUser.playerId);
 }
 
-function changeUser(val) {
-  currentUserId = val === "guest" ? "guest" : parseInt(val, 10);
-  if (currentUserId !== "guest") {
-    viewedProfilePlayerId = currentUserId;
-    activeProfileLeague = "ALL";
+function getTeamName(teamId) {
+  const team = teams.find(t => t.id === teamId);
+  return team ? team.name : teamId;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, char => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
+
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  const method = (options.method || "GET").toUpperCase();
+  if (csrfToken && !["GET", "HEAD", "OPTIONS"].includes(method)) {
+    headers.set("X-CSRF-Token", csrfToken);
   }
-  if (currentUserId === "guest" && (activeMainTab === "signup" || activeMainTab === "profile")) {
+  return fetch(url, { ...options, headers, credentials: "same-origin" });
+}
+
+async function responseError(response) {
+  const result = await response.json().catch(() => ({}));
+  return result.detail || `Požiadavka zlyhala (${response.status}).`;
+}
+
+function openLogin() {
+  const dialog = document.getElementById("login-dialog");
+  if (!dialog.open) dialog.showModal();
+  document.getElementById("login-username").focus();
+}
+
+function closeLogin() {
+  const form = document.getElementById("login-form");
+  form.reset();
+  const passwordInput = document.getElementById("login-password");
+  const toggleButton = document.getElementById("login-password-toggle");
+  passwordInput.type = "password";
+  toggleButton.innerText = "Zobraziť";
+  toggleButton.setAttribute("aria-label", "Zobraziť heslo");
+  toggleButton.setAttribute("aria-pressed", "false");
+  document.getElementById("login-dialog").close();
+}
+
+function toggleLoginPasswordVisibility() {
+  const passwordInput = document.getElementById("login-password");
+  const toggleButton = document.getElementById("login-password-toggle");
+  const visible = passwordInput.type === "password";
+  passwordInput.type = visible ? "text" : "password";
+  toggleButton.innerText = visible ? "Skryť" : "Zobraziť";
+  toggleButton.setAttribute("aria-label", visible ? "Skryť heslo" : "Zobraziť heslo");
+  toggleButton.setAttribute("aria-pressed", String(visible));
+}
+
+function openPasswordDialog(forced) {
+  const dialog = document.getElementById("password-dialog");
+  dialog.dataset.forced = String(forced);
+  document.getElementById("password-dialog-title").innerText = forced
+    ? "Nastavte si nové heslo"
+    : "Zmeniť heslo";
+  const currentField = document.getElementById("current-password-field");
+  currentField.classList.toggle("hidden", forced);
+  currentField.querySelector("input").required = !forced;
+  document.getElementById("password-cancel-btn").classList.toggle("hidden", forced);
+  document.getElementById("password-error").classList.add("hidden");
+  if (!dialog.open) dialog.showModal();
+}
+
+function closePasswordDialog() {
+  if (currentUser?.mustChangePassword) return;
+  document.getElementById("password-dialog").close();
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = document.getElementById("login-error");
+  error.classList.add("hidden");
+  try {
+    const response = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: JSON.stringify({
+        username: form.elements.username.value,
+        password: form.elements.password.value
+      })
+    });
+    if (!response.ok) throw new Error(await responseError(response));
+    currentUser = await response.json();
+    csrfToken = currentUser.csrfToken;
+    form.reset();
+    closeLogin();
+    await loadData();
+  } catch (e) {
+    error.innerText = e.message;
+    error.classList.remove("hidden");
+  }
+}
+
+async function submitPasswordChange(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const error = document.getElementById("password-error");
+  error.classList.add("hidden");
+  if (form.elements.newPassword.value !== form.elements.confirmPassword.value) {
+    error.innerText = "Nové heslá sa nezhodujú.";
+    error.classList.remove("hidden");
+    return;
+  }
+
+  try {
+    const response = await apiFetch("/api/auth/change-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        currentPassword: form.elements.currentPassword.value,
+        newPassword: form.elements.newPassword.value
+      })
+    });
+    if (!response.ok) throw new Error(await responseError(response));
+    currentUser = await response.json();
+    csrfToken = currentUser.csrfToken;
+    form.reset();
+    document.getElementById("password-dialog").close();
+    await loadData();
+  } catch (e) {
+    error.innerText = e.message;
+    error.classList.remove("hidden");
+  }
+}
+
+async function logout() {
+  try {
+    const response = await apiFetch("/api/auth/logout", { method: "POST" });
+    if (!response.ok) throw new Error(await responseError(response));
+    currentUser = null;
+    csrfToken = "";
     activeMainTab = "competitions";
+    document.getElementById("admin-credential-output").replaceChildren();
+    document.getElementById("admin-credential-output").classList.add("hidden");
+    await loadData();
+  } catch (e) {
+    window.alert(e.message);
   }
-  updateNavigation();
-  renderAll();
 }
 
 function updateNavigation() {
-  const isLogged = currentUserId !== "guest" && getCurrentPlayer() !== undefined;
-  document.getElementById("nav-signup").classList.toggle("hidden", !isLogged);
-  document.getElementById("nav-profile").classList.toggle("hidden", !isLogged);
+  const isPlayer = getCurrentPlayer() !== null;
+  const isAdmin = currentUser?.role === "admin" && !currentUser.mustChangePassword;
+  document.getElementById("nav-signup").classList.toggle("hidden", !isPlayer);
+  document.getElementById("nav-profile").classList.toggle("hidden", !isPlayer);
+  document.getElementById("nav-admin").classList.toggle("hidden", !isAdmin);
+  document.getElementById("login-open-btn").classList.toggle("hidden", Boolean(currentUser));
+  document.getElementById("password-change-btn").classList.toggle("hidden", !currentUser);
+  document.getElementById("logout-btn").classList.toggle("hidden", !currentUser);
+  document.getElementById("current-user-label").innerText = currentUser
+    ? (currentUser.name || currentUser.username)
+    : "";
 
-  ["competitions", "signup", "leaderboard", "profile"].forEach(t => {
+  ["competitions", "signup", "leaderboard", "profile", "admin"].forEach(t => {
     document.getElementById(`tab-${t}`).classList.toggle("hidden", t !== activeMainTab);
     const btn = document.getElementById(`nav-${t}`);
     if (btn) btn.classList.toggle("active", t === activeMainTab);
@@ -105,6 +253,11 @@ function updateNavigation() {
 }
 
 function switchMainTab(tab, updateUrl = true) {
+  if (tab === "signup" && !getCurrentPlayer()) {
+    openLogin();
+    return;
+  }
+  if (tab === "admin" && (currentUser?.role !== "admin" || currentUser.mustChangePassword)) return;
   activeMainTab = tab;
   if (tab === "profile" && !viewedProfilePlayerId) {
     const me = getCurrentPlayer();
@@ -112,6 +265,7 @@ function switchMainTab(tab, updateUrl = true) {
   }
   updateNavigation();
   renderAll();
+  if (tab === "admin") loadAdminAccounts();
 
   if (updateUrl && TAB_ROUTES[tab]) {
     window.history.pushState({ tab: tab }, "", TAB_ROUTES[tab]);
@@ -128,7 +282,9 @@ window.addEventListener("popstate", (event) => {
 
 function syncTabFromUrl(updateUrl = false) {
   const path = window.location.pathname;
-  const tab = ROUTE_TABS[path] || "competitions";
+  let tab = ROUTE_TABS[path] || "competitions";
+  if (tab === "signup" && !getCurrentPlayer()) tab = "competitions";
+  if (tab === "admin" && currentUser?.role !== "admin") tab = "competitions";
   switchMainTab(tab, updateUrl);
 }
 
@@ -216,11 +372,11 @@ function renderCompetitions() {
         <div class="match-row" onclick="toggleMatch(${m.id})">
           <div style="display:flex;align-items:center;gap:10px;">
             <span class="${m.isHome ? 'tag-home' : 'tag-away'}">${m.isHome ? 'DOMA' : 'VONKU'}</span>
-            <span style="font-size:12px;color:#71717a;"><strong>${m.round}</strong> • ${matchDate} • ${m.slot}</span>
+            <span style="font-size:12px;color:#71717a;"><strong>${escapeHtml(m.round)}</strong> • ${escapeHtml(matchDate)} • ${escapeHtml(m.slot)}</span>
           </div>
-          <div class="match-teams">${m.home} <span style="color:#71717a;font-weight:400;">vs</span> ${m.away}</div>
+          <div class="match-teams">${escapeHtml(m.home)} <span style="color:#71717a;font-weight:400;">vs</span> ${escapeHtml(m.away)}</div>
           <div>
-            ${m.status === 'played' ? `<span class="score-pill">${m.score}</span>` : `<span class="slot-pill">${m.slot}</span>`}
+            ${m.status === 'played' ? `<span class="score-pill">${escapeHtml(m.score)}</span>` : `<span class="slot-pill">${escapeHtml(m.slot)}</span>`}
           </div>
         </div>
         ${isExp ? `
@@ -228,7 +384,7 @@ function renderCompetitions() {
             <div class="stats-grid">
               <div class="stats-box">
                 <div class="stats-box-header">
-                  <span>Úspešnosť v ${team.league}: Keraming (${m.teamId})</span>
+                  <span>Úspešnosť v ${team.league}: Keraming (${escapeHtml(m.teamId)})</span>
                   <span>Výhry:Prehry (Záp.) • Úsp.</span>
                 </div>
                 ${rosterPlayers.length > 0 ? rosterPlayers.map(p => {
@@ -238,7 +394,7 @@ function renderCompetitions() {
                   return `
                     <div class="player-stat-row">
                       <div>
-                        <span class="player-link" onclick="openPlayerProfile(${p.id}, '${activeTeamId}')">${p.name}</span>
+                        <span class="player-link" onclick="openPlayerProfile(${p.id}, '${activeTeamId}')">${escapeHtml(p.name)}</span>
                         <span style="font-size:11px;color:#71717a;margin-left:6px;">(${st.encounters}/${st.teamPlayed} stret. • ${st.attendancePct} %)</span>
                       </div>
                       <span><strong>${st.won}:${st.lost}</strong> <span style="color:#71717a;font-size:11px;">(${total} záp.)</span> • <strong>${pct} %</strong></span>
@@ -249,7 +405,7 @@ function renderCompetitions() {
 
               <div class="stats-box">
                 <div class="stats-box-header">
-                  <span>Úspešnosť súpera: ${oppTeam}</span>
+                  <span>Úspešnosť súpera: ${escapeHtml(oppTeam)}</span>
                   <span>Výhry:Prehry (Záp.) • Úsp.</span>
                 </div>
                 ${opps.length > 0 ? opps.map(o => {
@@ -257,7 +413,7 @@ function renderCompetitions() {
                   const pct = total > 0 ? Math.round((o.won / total) * 100) : 0;
                   return `
                     <div class="player-stat-row">
-                      <span><strong>${o.name}</strong></span>
+                      <span><strong>${escapeHtml(o.name)}</strong></span>
                       <span><strong>${o.won}:${o.lost}</strong> <span style="color:#71717a;font-size:11px;">(${total} záp.)</span> • <strong>${pct} %</strong></span>
                     </div>
                   `;
@@ -273,13 +429,17 @@ function renderCompetitions() {
 
 function renderSignupTab() {
   const me = getCurrentPlayer();
-  if (!me) return;
+  if (!me) {
+    document.getElementById("my-signup-box").innerHTML = "";
+    document.getElementById("signup-table-body").innerHTML = "";
+    return;
+  }
 
   document.getElementById("my-signup-box").innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
       <div>
-        <span style="font-size:15px;font-weight:800;">Moja dochádzka na sobotu: ${me.name}</span>
-        <span style="font-size:12px;color:#71717a;margin-left:8px;">(Tvoja súpiska: ${me.roster.map(r => 'Muži ' + r).join(', ')})</span>
+        <span style="font-size:15px;font-weight:800;">Moja dochádzka na sobotu: ${escapeHtml(me.name)}</span>
+        <span style="font-size:12px;color:#71717a;margin-left:8px;">(Tvoja súpiska: ${me.roster.map(getTeamName).join(', ')})</span>
       </div>
       <span id="save-indicator" style="font-size:12px;font-weight:700;color:#16a34a;"></span>
     </div>
@@ -326,7 +486,7 @@ function renderSignupTab() {
         <input type="checkbox" ${me.takesCar ? 'checked' : ''} onchange="toggleMyCar(this.checked)">
         <span>🚗 Môžem zobrať auto</span>
       </label>
-      <input type="text" class="note-input" value="${me.note || ''}" onchange="updateMyNote(this.value)" placeholder="Poznámka (napr. môžem len 1 zápas / beriem 3 ľudí)...">
+      <input type="text" class="note-input" value="${escapeHtml(me.note || '')}" onchange="updateMyNote(this.value)" placeholder="Poznámka (napr. môžem len 1 zápas / beriem 3 ľudí)...">
       <button class="btn-primary" onclick="saveMySignup()">Uložiť moju voľbu</button>
     </div>
   `;
@@ -336,8 +496,8 @@ function renderSignupTab() {
     return `
       <tr class="${isMe ? 'me-row' : ''}">
         <td>
-          <strong>${p.name}</strong> ${isMe ? '<span style="font-size:11px;font-weight:700;color:#ca8a04;">(Ty)</span>' : ''}
-          <div style="font-size:11px;color:#71717a;">Súpiska: ${p.roster.join(", ")}</div>
+          <strong>${escapeHtml(p.name)}</strong> ${isMe ? '<span style="font-size:11px;font-weight:700;color:#ca8a04;">(Ty)</span>' : ''}
+          <div style="font-size:11px;color:#71717a;">Súpiska: ${p.roster.map(getTeamName).join(", ")}</div>
         </td>
         <td>
           ${p.cannotPlay ? '<span class="cannot-badge">✕ Nemôže</span>' : (p.canMorning ? '<span class="yes-badge">✓ Môže doobeda</span>' : '<span class="no-badge">—</span>')}
@@ -356,7 +516,7 @@ function renderSignupTab() {
         </td>
         <td>
           ${p.takesCar && !p.cannotPlay ? '<span style="font-size:12px;font-weight:700;color:#1d4ed8;">🚗 Auto</span> ' : ''}
-          <span style="font-size:12px;color:#71717a;">${p.note || ''}</span>
+          <span style="font-size:12px;color:#71717a;">${escapeHtml(p.note || '')}</span>
         </td>
       </tr>
     `;
@@ -414,11 +574,10 @@ async function saveMySignup() {
   if (!me) return;
   renderSignupTab();
   try {
-    await fetch("/api/signup", {
+    const response = await apiFetch("/api/signup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        playerId: me.id,
         canMorning: me.canMorning,
         canAfternoon: me.canAfternoon,
         cannotPlay: me.cannotPlay,
@@ -427,9 +586,120 @@ async function saveMySignup() {
         note: me.note
       })
     });
+    if (!response.ok) throw new Error(await responseError(response));
     const ind = document.getElementById("save-indicator");
     if (ind) ind.innerText = "✓ Uložené v databáze";
-  } catch (e) {}
+  } catch (e) {
+    const ind = document.getElementById("save-indicator");
+    if (ind) {
+      ind.innerText = e.message;
+      ind.style.color = "#dc2626";
+    }
+  }
+}
+
+function suggestedUsername(name) {
+  const username = name.normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, ".")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, 32);
+  return username.length >= 3 ? username : `hrac${Date.now().toString().slice(-6)}`;
+}
+
+function showAdminMessage(message, isError = false) {
+  const box = document.getElementById("admin-message");
+  box.innerText = message;
+  box.style.color = isError ? "#dc2626" : "#16a34a";
+  box.classList.remove("hidden");
+}
+
+function showTemporaryCredentials(username, temporaryPassword, action) {
+  const box = document.getElementById("admin-credential-output");
+  box.replaceChildren();
+  const title = document.createElement("strong");
+  title.innerText = action;
+  const details = document.createElement("p");
+  details.innerText = `Meno: ${username} · Dočasné heslo: `;
+  const password = document.createElement("code");
+  password.innerText = temporaryPassword;
+  details.append(password);
+  const note = document.createElement("p");
+  note.innerText = "Zobrazí sa iba teraz. Odovzdaj ho hráčovi súkromne; po prihlásení si musí nastaviť nové heslo.";
+  box.append(title, details, note);
+  box.classList.remove("hidden");
+}
+
+async function loadAdminAccounts() {
+  const tbody = document.getElementById("admin-accounts-body");
+  tbody.innerHTML = `<tr><td colspan="3">Načítavam účty…</td></tr>`;
+  document.getElementById("admin-message").classList.add("hidden");
+  try {
+    const response = await apiFetch("/api/admin/accounts");
+    if (!response.ok) throw new Error(await responseError(response));
+    const accounts = await response.json();
+    tbody.innerHTML = accounts.map(account => `
+      <tr>
+        <td>
+          <strong>${escapeHtml(account.name)}</strong>
+          <div style="font-size:11px;color:#71717a;">Súpiska: ${account.roster.map(getTeamName).join(", ")}</div>
+        </td>
+        <td>
+          <input id="admin-username-${account.playerId}" class="account-username-input" value="${escapeHtml(account.username || suggestedUsername(account.name))}" maxlength="32" aria-label="Prihlasovacie meno pre ${escapeHtml(account.name)}">
+        </td>
+        <td>
+          <div class="account-actions">
+            ${account.username
+              ? `<button class="btn-primary" type="button" onclick="updatePlayerUsername(${account.playerId})">Uložiť meno</button>
+                 <button class="nav-btn" type="button" onclick="resetPlayerPassword(${account.playerId})">Resetovať heslo</button>`
+              : `<button class="btn-primary" type="button" onclick="createPlayerAccount(${account.playerId})">Vytvoriť účet</button>`}
+          </div>
+        </td>
+      </tr>
+    `).join("");
+  } catch (e) {
+    tbody.innerHTML = "";
+    showAdminMessage(e.message, true);
+  }
+}
+
+async function createPlayerAccount(playerId) {
+  const username = document.getElementById(`admin-username-${playerId}`).value;
+  await runAdminAccountAction(`/api/admin/accounts`, "POST", { playerId, username }, "Účet bol vytvorený.");
+}
+
+async function updatePlayerUsername(playerId) {
+  const username = document.getElementById(`admin-username-${playerId}`).value;
+  await runAdminAccountAction(`/api/admin/accounts/${playerId}`, "PUT", { username }, "Prihlasovacie meno bolo zmenené.");
+}
+
+async function resetPlayerPassword(playerId) {
+  if (!window.confirm("Nastaviť hráčovi nové dočasné heslo? Jeho existujúce prihlásenia sa ukončia.")) return;
+  await runAdminAccountAction(`/api/admin/accounts/${playerId}/reset-password`, "POST", {}, "Heslo bolo resetované.");
+}
+
+async function runAdminAccountAction(url, method, body, successMessage) {
+  const credentials = document.getElementById("admin-credential-output");
+  credentials.replaceChildren();
+  credentials.classList.add("hidden");
+  try {
+    const response = await apiFetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) throw new Error(await responseError(response));
+    const result = await response.json();
+    await loadAdminAccounts();
+    if (result.temporaryPassword) {
+      showTemporaryCredentials(result.username, result.temporaryPassword, successMessage);
+    } else {
+      showAdminMessage(successMessage);
+    }
+  } catch (e) {
+    showAdminMessage(e.message, true);
+  }
 }
 
 // Vyberie súťaž hráča, kde má odohraných >= 40 % stretnutí a najvyšší K-Index
@@ -492,7 +762,7 @@ function renderLeaderboard() {
     return `
       <tr style="cursor:pointer;" onclick="openPlayerProfile(${p.id}, '${s.team.id}')">
         <td><strong>${i + 1}.</strong></td>
-        <td><span class="player-link">${p.name}</span></td>
+        <td><span class="player-link">${escapeHtml(p.name)}</span></td>
         <td>
           <strong>${s.team.name}</strong> – ${s.team.league} (×${s.team.coef.toFixed(2)})
           <div style="font-size:11px;color:#16a34a;font-weight:600;">✓ Účasť: ${s.encounters}/${s.teamPlayed} stret. (${s.attendancePct} %)</div>
@@ -518,7 +788,7 @@ function renderLeaderboard() {
       return `
         <tr style="cursor:pointer;opacity:0.65;" onclick="openPlayerProfile(${p.id}, '${s.team.id}')">
           <td>—</td>
-          <td><span class="player-link">${p.name}</span></td>
+          <td><span class="player-link">${escapeHtml(p.name)}</span></td>
           <td>
             ${s.team.name} – ${s.team.league}
             <div style="font-size:11px;color:#dc2626;">Účasť: ${s.encounters}/${s.teamPlayed} stret. (${s.attendancePct} % &lt; 40 %)</div>
@@ -656,9 +926,9 @@ function renderProfile() {
       <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div>
           <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:#71717a;">Karta hráča</div>
-          <h2 style="font-size:24px;font-weight:800;margin-top:2px;">${p.name}</h2>
+          <h2 style="font-size:24px;font-weight:800;margin-top:2px;">${escapeHtml(p.name)}</h2>
           <p style="font-size:13px;color:#71717a;margin-top:2px;">
-            Súpiska v klube: <strong>${p.roster.map(r => 'Muži ' + r).join(', ')}</strong>
+            Súpiska v klube: <strong>${p.roster.map(getTeamName).join(', ')}</strong>
           </p>
           ${p.stolnytenisUrl
             ? `<a class="external-profile-link" href="${p.stolnytenisUrl}" target="_blank" rel="noopener noreferrer">Profil hráča na stolnytenis.info ↗</a>`
@@ -703,10 +973,18 @@ function renderProfile() {
 }
 
 function renderAll() {
+  updateNavigation();
   renderCompetitions();
   renderSignupTab();
   renderLeaderboard();
   renderProfile();
 }
+
+document.getElementById("login-form").addEventListener("submit", submitLogin);
+document.getElementById("login-password-toggle").addEventListener("click", toggleLoginPasswordVisibility);
+document.getElementById("password-form").addEventListener("submit", submitPasswordChange);
+document.getElementById("password-dialog").addEventListener("cancel", event => {
+  if (currentUser?.mustChangePassword) event.preventDefault();
+});
 
 loadData();

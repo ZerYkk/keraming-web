@@ -11,7 +11,7 @@
   <header>
     <div class="header-inner">
       <div class="brand" onclick="switchMainTab('competitions')">
-        <div class="brand-logo">KT</div>
+        <img class="brand-logo" src="/static/img/keraming-logo.jpeg" alt="Logo Stolnotenisového klubu Keraming Trenčín">
         <div>
           <span class="brand-title">Keraming Trenčín</span>
           <span class="brand-sub">Prepojené so stolnytenis.info</span>
@@ -23,12 +23,14 @@
         <button id="nav-signup" class="nav-btn" onclick="switchMainTab('signup')">Prihlasovanie na zápasy</button>
         <button id="nav-leaderboard" class="nav-btn" onclick="switchMainTab('leaderboard')">Rebríček klubu</button>
         <button id="nav-profile" class="nav-btn" onclick="openMyProfile()">Môj profil</button>
+        <button id="nav-admin" class="nav-btn hidden" onclick="switchMainTab('admin')">Správa účtov</button>
       </nav>
 
-      <div>
-        <select id="user-switcher" class="user-select" onchange="changeUser(this.value)">
-          <option value="guest">🔒 Neprihlásený návštevník</option>
-        </select>
+      <div class="auth-actions">
+        <span id="current-user-label" class="auth-user-label"></span>
+        <button id="login-open-btn" class="nav-btn" type="button" onclick="openLogin()">Prihlásiť</button>
+        <button id="password-change-btn" class="nav-btn hidden" type="button" onclick="openPasswordDialog(false)">Zmeniť heslo</button>
+        <button id="logout-btn" class="nav-btn hidden" type="button" onclick="logout()">Odhlásiť</button>
       </div>
     </div>
   </header>
@@ -105,7 +107,75 @@
     <section id="tab-profile" class="hidden">
       <div id="profile-container"></div>
     </section>
+
+    <section id="tab-admin" class="hidden">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Správa hráčskych účtov</div>
+          <div class="section-sub">Vytvor účty hráčom alebo nastav dočasné heslo pri zabudnutí. Heslo sa zobrazí iba raz.</div>
+        </div>
+      </div>
+      <div id="admin-message" class="auth-message hidden" role="status"></div>
+      <div id="admin-credential-output" class="credential-output hidden" aria-live="polite"></div>
+      <div class="table-card">
+        <table>
+          <thead>
+            <tr>
+              <th>Hráč</th>
+              <th>Prihlasovacie meno</th>
+              <th>Akcia</th>
+            </tr>
+          </thead>
+          <tbody id="admin-accounts-body"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
+
+  <dialog id="login-dialog" class="auth-dialog">
+    <form id="login-form" class="auth-form">
+      <h2>Prihlásenie</h2>
+      <p id="login-error" class="auth-message hidden" role="alert"></p>
+      <label>
+        Prihlasovacie meno
+        <input id="login-username" name="username" autocomplete="username" required maxlength="32">
+      </label>
+      <label>
+        Heslo
+        <span class="password-input-wrap">
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="128">
+          <button id="login-password-toggle" class="password-toggle" type="button" aria-label="Zobraziť heslo" aria-controls="login-password" aria-pressed="false">Zobraziť</button>
+        </span>
+      </label>
+      <div class="auth-form-actions">
+        <button class="btn-primary" type="submit">Prihlásiť</button>
+        <button class="nav-btn" type="button" onclick="closeLogin()">Zrušiť</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="password-dialog" class="auth-dialog">
+    <form id="password-form" class="auth-form">
+      <h2 id="password-dialog-title">Zmeniť heslo</h2>
+      <p id="password-error" class="auth-message hidden" role="alert"></p>
+      <label id="current-password-field">
+        Súčasné heslo
+        <input name="currentPassword" type="password" autocomplete="current-password" maxlength="128">
+      </label>
+      <label>
+        Nové heslo (aspoň 8 znakov)
+        <input name="newPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+      </label>
+      <label>
+        Zopakuj nové heslo
+        <input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" maxlength="128" required>
+      </label>
+      <div class="auth-form-actions">
+        <button class="btn-primary" type="submit">Uložiť heslo</button>
+        <button id="password-cancel-btn" class="nav-btn" type="button" onclick="closePasswordDialog()">Zrušiť</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/static/js/app.js?v={{ asset_version }}"></script>
 </body>

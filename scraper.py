@@ -31,6 +31,10 @@ LEAGUES = {
     "G": {
         "match_name": "Keraming Trenčín G",
         "url": "https://www.stolnytenis.info/liga/sezona-2026-27-6-liga-muzi-ostz-trencin"
+    },
+    "H": {
+        "match_name": "Keraming Trenčín",
+        "url": "https://www.stolnytenis.info/liga/sezona-2026-27-extraliga-zeny-sstz"
     }
 }
 
@@ -142,6 +146,46 @@ def extract_stolnytenis_player_id(card):
     return profile_id_match.group(1) if profile_id_match else None
 
 
+def extract_roster_players(soup, team_ids):
+    roster_players = []
+    for club_card in soup.select("div.card__supisky"):
+        club_heading = club_card.select_one(".sticky-header h3")
+        if not club_heading:
+            continue
+
+        club_name = club_heading.get_text(" ", strip=True)
+        if "keraming" not in club_name.lower():
+            continue
+
+        matched_tids = [
+            team_id for team_id in team_ids
+            if match_team_belongs(team_id, LEAGUES[team_id]["match_name"], club_name)
+        ]
+        if not matched_tids and len(team_ids) == 1:
+            matched_tids = team_ids
+        if not matched_tids:
+            continue
+
+        for name_element in club_card.select(".trn__avatar__name"):
+            badge = name_element.select_one(".badge")
+            if badge:
+                badge.decompose()
+            player_name = name_element.get_text(" ", strip=True)
+            if not player_name:
+                continue
+
+            player_card = name_element.find_parent("div", class_="card")
+            onclick = player_card.get("onclick", "") if player_card else ""
+            player_id_match = re.search(r"/hrac/(\d+)", onclick)
+            roster_players.append({
+                "name": player_name,
+                "teamIds": matched_tids,
+                "playerId": player_id_match.group(1) if player_id_match else None
+            })
+
+    return roster_players
+
+
 def extract_match_schedule(match_div):
     match_group = match_div.find_parent("div", class_="mb-3")
     round_header = match_group.select_one(".mtchrnd__num") if match_group else None
@@ -239,7 +283,7 @@ def sync_from_stolnytenis(db_file: str):
             except Exception as e:
                 print(f"Chyba rozpisu {team_id}: {e}")
 
-        # 2. ÚSPEŠNOSŤ PODĽA SÚŤAŽÍ (každú unikátnu URL stiahneme iba raz)
+        # 2. SÚPISKY (každú unikátnu URL stiahneme iba raz)
         unique_urls = {}
         for tid, l_data in LEAGUES.items():
             u = l_data["url"].rstrip("/")
@@ -249,6 +293,31 @@ def sync_from_stolnytenis(db_file: str):
 
         player_totals = {}
 
+        for u, team_ids in unique_urls.items():
+            try:
+                roster_response = client.get(f"{u}/supisky")
+                if roster_response.status_code != 200:
+                    continue
+
+                roster_soup = BeautifulSoup(roster_response.text, "html.parser")
+                for roster_player in extract_roster_players(roster_soup, team_ids):
+                    player_name = roster_player["name"]
+                    matched_tids = roster_player["teamIds"]
+                    if player_name not in player_totals:
+                        player_totals[player_name] = {
+                            "primary_team": matched_tids[0],
+                            "rosters": set(),
+                            "won": 0,
+                            "lost": 0,
+                            "stolnytenis_player_id": roster_player["playerId"]
+                        }
+                    player_totals[player_name]["rosters"].update(matched_tids)
+                    if roster_player["playerId"]:
+                        player_totals[player_name]["stolnytenis_player_id"] = roster_player["playerId"]
+            except Exception as e:
+                print(f"Chyba súpisky {u}: {e}")
+
+        # 3. ÚSPEŠNOSŤ PODĽA SÚŤAŽÍ
         for u, team_ids in unique_urls.items():
             try:
                 resp_usp = client.get(f"{u}/uspesnost")
