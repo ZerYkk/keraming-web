@@ -23,7 +23,8 @@ from apscheduler.triggers.cron import CronTrigger
 
 from scraper import sync_from_stolnytenis
 
-DB_FILE = os.getenv("DB_FILE", "keraming.db")
+APP_DIR = Path(__file__).resolve().parent
+DB_FILE = os.getenv("DB_FILE", str(APP_DIR / "keraming.db"))
 SESSION_COOKIE = "keraming_session"
 SESSION_DURATION = timedelta(days=14)
 COOKIE_SECURE_OVERRIDE = os.getenv("COOKIE_SECURE")
@@ -118,8 +119,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Keraming Trenčín", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory=str(APP_DIR / "static")), name="static")
+templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 
 
 def get_db():
