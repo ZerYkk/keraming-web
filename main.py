@@ -7,6 +7,7 @@ import re
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from getpass import getpass
 from typing import List
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from scraper import sync_from_stolnytenis
 
@@ -32,6 +34,7 @@ TEMP_PASSWORD_LENGTH = 8
 TEMP_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
 
 scheduler = BackgroundScheduler()
+LOCAL_TIMEZONE = ZoneInfo("Europe/Bratislava")
 
 
 def auto_sync_task():
@@ -43,9 +46,66 @@ def auto_sync_task():
         print(f"[AUTOSYNC CHYBA]: {e}")
 
 
+def completed_signup_saturday(now=None):
+    now = now or datetime.now(LOCAL_TIMEZONE)
+    if now.weekday() == 5:
+        return None
+    saturday = now.date() - timedelta(days=(now.weekday() - 5) % 7)
+    return saturday.isoformat()
+
+
+def reset_weekly_signups(now=None):
+    saturday = completed_signup_saturday(now)
+    if saturday is None:
+        return False
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signup_reset_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_reset_date TEXT
+        )
+    """)
+    state = conn.execute(
+        "SELECT last_reset_date FROM signup_reset_state WHERE id = 1"
+    ).fetchone()
+    if state and state["last_reset_date"] == saturday:
+        conn.close()
+        return False
+
+    clear_signup_choices(conn)
+    conn.execute("""
+        INSERT INTO signup_reset_state (id, last_reset_date)
+        VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET last_reset_date = excluded.last_reset_date
+    """, (saturday,))
+    conn.commit()
+    conn.close()
+    print(f"[SIGNUP RESET] Prihlásenia resetované po sobote {saturday}.")
+    return True
+
+
+def clear_signup_choices(conn):
+    conn.execute("""
+        UPDATE players
+        SET can_morning = 0,
+            can_afternoon = 0,
+            cannot_play = 0,
+            selected_leagues = '',
+            takes_car = 0,
+            note = ''
+    """)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    reset_weekly_signups()
+    scheduler.add_job(
+        reset_weekly_signups,
+        CronTrigger(day_of_week="sun", hour=0, minute=0, timezone=LOCAL_TIMEZONE),
+        id="weekly_signup_reset",
+        replace_existing=True
+    )
     # Spustíme synchronizáciu hneď pri štarte, aby boli dáta okamžite čerstvé a opravené
     auto_sync_task()
     # Pravidelná synchronizácia každých 6 hodín
@@ -160,6 +220,13 @@ def init_db():
         c.execute(
             "ALTER TABLE login_attempts ADD COLUMN remote_address TEXT NOT NULL DEFAULT ''"
         )
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS signup_reset_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_reset_date TEXT
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -304,6 +371,32 @@ def create_admin_account(username: str, password: str):
         conn.commit()
     except sqlite3.IntegrityError as exc:
         raise ValueError("Toto prihlasovacie meno už existuje.") from exc
+    finally:
+        conn.close()
+
+
+def reset_admin_password(username: str, password: str):
+    try:
+        username = normalize_username(username)
+    except HTTPException as exc:
+        raise ValueError(exc.detail) from exc
+    if len(password) < PASSWORD_MIN_LENGTH:
+        raise ValueError(f"Heslo musí mať aspoň {PASSWORD_MIN_LENGTH} znakov.")
+
+    conn = get_db()
+    try:
+        account = conn.execute(
+            "SELECT id FROM users WHERE username = ? AND role = 'admin'",
+            (username,)
+        ).fetchone()
+        if not account:
+            raise ValueError("Administrátorský účet sa nenašiel.")
+        conn.execute(
+            "UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?",
+            (hash_password(password), account["id"])
+        )
+        conn.execute("DELETE FROM login_sessions WHERE user_id = ?", (account["id"],))
+        conn.commit()
     finally:
         conn.close()
 
@@ -468,6 +561,7 @@ def run_sync(request: Request):
 
 @app.get("/api/players")
 def get_players(request: Request):
+    reset_weekly_signups()
     user = get_optional_user(request)
     can_view_signup = user is not None and not user["must_change_password"]
     conn = get_db()
@@ -605,6 +699,16 @@ def get_accounts(request: Request):
         }
         for row in rows
     ]
+
+
+@app.post("/api/admin/signup/reset")
+def reset_signups_now(request: Request):
+    require_admin(request)
+    conn = get_db()
+    clear_signup_choices(conn)
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @app.post("/api/admin/accounts")
@@ -755,6 +859,7 @@ def update_signup(data: SignupPayload, request: Request):
     if user["role"] != "player" or user["player_id"] is None:
         raise HTTPException(status_code=403, detail="Prihlasovať sa môže iba hráčsky účet.")
 
+    reset_weekly_signups()
     conn = get_db()
     player = conn.execute("SELECT * FROM players WHERE id = ?", (user["player_id"],)).fetchone()
     if not player:
@@ -784,15 +889,22 @@ def update_signup(data: SignupPayload, request: Request):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] != "create-admin":
-        raise SystemExit("Použitie: python main.py create-admin <používateľské_meno>")
+    if len(sys.argv) != 3 or sys.argv[1] not in {"create-admin", "reset-admin"}:
+        raise SystemExit(
+            "Použitie: python main.py create-admin|reset-admin <používateľské_meno>"
+        )
 
     init_db()
     first_password = getpass(f"Heslo administrátora (min. {PASSWORD_MIN_LENGTH} znakov): ")
     if first_password != getpass("Zopakujte heslo: "):
         raise SystemExit("Heslá sa nezhodujú.")
     try:
-        create_admin_account(sys.argv[2], first_password)
+        if sys.argv[1] == "create-admin":
+            create_admin_account(sys.argv[2], first_password)
+            action = "vytvorený"
+        else:
+            reset_admin_password(sys.argv[2], first_password)
+            action = "resetovaný"
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    print(f"Administrátorský účet {sys.argv[2].strip().lower()} bol vytvorený.")
+    print(f"Administrátorský účet {sys.argv[2].strip().lower()} bol {action}.")

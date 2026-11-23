@@ -1,6 +1,7 @@
 import hashlib
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -46,6 +47,34 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/sprava-uctov")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertIn("login-form", response.text)
+
+    async def test_site_uses_keraming_logo_for_header_and_favicon(self):
+        response = await self.client.get("/")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn('rel="icon" type="image/png" href="/static/img/keraming-logo.png"', response.text)
+        self.assertIn('src="/static/img/keraming-logo.png"', response.text)
+
+        logo = await self.client.get("/static/img/keraming-logo.png")
+        self.assertEqual(logo.status_code, 200, logo.text)
+        self.assertEqual(logo.headers["content-type"], "image/png")
+
+    async def test_admin_can_read_signup_fields(self):
+        await self.login(self.admin_client, "admin", "AdminHesloTest123")
+        response = await self.admin_client.get("/api/players")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        player = next(item for item in response.json() if item["name"] == "Hráč Jeden")
+        self.assertIn("canMorning", player)
+        self.assertIn("selectedLeagues", player)
+        self.assertIn("note", player)
+
+    async def test_reset_admin_password_changes_password_and_revokes_sessions(self):
+        await self.login(self.admin_client, "admin", "AdminHesloTest123")
+        main.reset_admin_password("admin", "NoveAdminHeslo123")
+
+        self.assertEqual((await self.admin_client.get("/api/auth/me")).status_code, 401)
+        login = await self.login(self.client, "admin", "NoveAdminHeslo123")
+        self.assertEqual(login["role"], "admin")
 
     async def test_session_cookie_is_secure_on_public_hosts_but_not_local_http(self):
         previous_override = main.COOKIE_SECURE_OVERRIDE
@@ -139,6 +168,74 @@ class AuthenticationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed.status_code, 200, changed.text)
         self.assertFalse(changed.json()["mustChangePassword"])
         await self.login(self.admin_client, "hrac.jeden", "Heslo123")
+
+    async def test_weekly_signup_reset_runs_after_saturday_only_once(self):
+        conn = main.get_db()
+        conn.execute("""
+            UPDATE players
+            SET can_morning = 1, can_afternoon = 1, cannot_play = 0,
+                selected_leagues = 'A', takes_car = 1, note = 'Sobota'
+            WHERE id = 1
+        """)
+        conn.commit()
+        conn.close()
+
+        saturday = datetime(2026, 11, 21, 18, 0)
+        self.assertFalse(main.reset_weekly_signups(saturday))
+        conn = main.get_db()
+        morning = conn.execute("SELECT can_morning FROM players WHERE id = 1").fetchone()[0]
+        conn.close()
+        self.assertEqual(morning, 1)
+
+        sunday = datetime(2026, 11, 22, 0, 1)
+        self.assertTrue(main.reset_weekly_signups(sunday))
+        self.assertFalse(main.reset_weekly_signups(sunday))
+
+        conn = main.get_db()
+        reset = conn.execute("""
+            SELECT can_morning, can_afternoon, cannot_play,
+                   selected_leagues, takes_car, note
+            FROM players WHERE id = 1
+        """).fetchone()
+        conn.close()
+        self.assertEqual(
+            (reset["can_morning"], reset["can_afternoon"], reset["cannot_play"],
+             reset["selected_leagues"], reset["takes_car"], reset["note"]),
+            (0, 0, 0, "", 0, "")
+        )
+
+    async def test_admin_can_reset_all_weekly_signups_immediately(self):
+        conn = main.get_db()
+        conn.execute("""
+            UPDATE players
+            SET can_morning = 1, can_afternoon = 1, cannot_play = 0,
+                selected_leagues = 'A', takes_car = 1, note = 'Administratívny reset'
+        """)
+        conn.commit()
+        conn.close()
+
+        admin = await self.login(self.admin_client, "admin", "AdminHesloTest123")
+        response = await self.admin_client.post(
+            "/api/admin/signup/reset",
+            headers={"X-CSRF-Token": admin["csrfToken"]}
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["ok"])
+
+        conn = main.get_db()
+        rows = conn.execute("""
+            SELECT can_morning, can_afternoon, cannot_play,
+                   selected_leagues, takes_car, note
+            FROM players
+        """).fetchall()
+        conn.close()
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(
+                (row["can_morning"], row["can_afternoon"], row["cannot_play"],
+                 row["selected_leagues"], row["takes_car"], row["note"]),
+                (0, 0, 0, "", 0, "")
+            )
 
     async def test_player_accounts_are_owned_and_admin_reset_revokes_sessions(self):
         signup_payload = {

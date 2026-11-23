@@ -2,6 +2,7 @@ import sqlite3
 import httpx
 from bs4 import BeautifulSoup
 import re
+from datetime import date
 
 LEAGUES = {
     "A": {
@@ -206,6 +207,44 @@ def extract_match_schedule(match_div):
     return round_str, match_date, match_time
 
 
+def match_date_is_future(match_date_str):
+    match_date_match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", match_date_str)
+    if not match_date_match:
+        return False
+    day, month, year = map(int, match_date_match.groups())
+    try:
+        return date(year, month, day) > date.today()
+    except ValueError:
+        return False
+
+
+def extract_singles_results(match_soup):
+    results = []
+    for row in match_soup.select(".mtchv"):
+        row_type = row.select_one(".mtchv__1")
+        if not row_type or "dvojhra" not in row_type.get_text(" ", strip=True).lower():
+            continue
+
+        players = row.select(".mtchv__2 .mtchv__player")
+        score = row.select_one(".mtchv__result")
+        score_match = re.search(r"(\d+)\s*:\s*(\d+)", score.get_text(" ", strip=True) if score else "")
+        if len(players) != 2 or not score_match:
+            continue
+
+        home_score, away_score = map(int, score_match.groups())
+        if home_score == away_score:
+            continue
+
+        for index, player in enumerate(players):
+            name_link = player.select_one('a[href*="/hrac/"]')
+            player_name = name_link.get_text(" ", strip=True) if name_link else ""
+            if not player_name:
+                continue
+            won = home_score > away_score if index == 0 else away_score > home_score
+            results.append({"name": player_name, "is_home": index == 0, "won": won})
+    return results
+
+
 def sync_from_stolnytenis(db_file: str):
     conn = sqlite3.connect(db_file)
     conn.row_factory = sqlite3.Row
@@ -222,6 +261,7 @@ def sync_from_stolnytenis(db_file: str):
     synced_matches = 0
     synced_club_players = 0
     synced_opponents = 0
+    future_played_fixtures = {}
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -268,6 +308,14 @@ def sync_from_stolnytenis(db_file: str):
                                 if (h_txt != "0" or a_txt != "0") or has_result_class:
                                     score_str = f"{h_txt} : {a_txt}"
                                     status = "played"
+
+                        if status == "played" and raw_match_id and match_date_is_future(match_date_str):
+                            fixture = future_played_fixtures.setdefault(raw_match_id, {
+                                "home_team": home_name,
+                                "away_team": away_name,
+                                "league_ids": set()
+                            })
+                            fixture["league_ids"].add(team_id)
 
                         cursor.execute("""
                             INSERT INTO matches (external_id, team_id, round, match_date, slot, home_team, away_team, is_home, status, score)
@@ -381,6 +429,45 @@ def sync_from_stolnytenis(db_file: str):
 
             except Exception as e:
                 print(f"Chyba úspešnosti {u}: {e}")
+
+        for match_id, fixture in future_played_fixtures.items():
+            try:
+                response = client.get(f"https://www.stolnytenis.info/zapas/{match_id}")
+                if response.status_code != 200:
+                    print(f"Chyba výsledku predohrávky {match_id}: HTTP {response.status_code}")
+                    continue
+
+                singles_results = extract_singles_results(BeautifulSoup(response.text, "html.parser"))
+                match_stats = {}
+                for result in singles_results:
+                    club_name = fixture["home_team"] if result["is_home"] else fixture["away_team"]
+                    for team_id in fixture["league_ids"]:
+                        if not match_team_belongs(team_id, LEAGUES[team_id]["match_name"], club_name):
+                            continue
+                        key = (team_id, club_name, result["name"])
+                        stats = match_stats.setdefault(key, {"won": 0, "lost": 0})
+                        stats["won" if result["won"] else "lost"] += 1
+
+                for (team_id, club_name, player_name), stats in match_stats.items():
+                    existing = cursor.execute("""
+                        SELECT id FROM league_players
+                        WHERE league_id = ? AND LOWER(club_name) = LOWER(?) AND LOWER(player_name) = LOWER(?)
+                    """, (team_id, club_name, player_name)).fetchone()
+                    if existing:
+                        cursor.execute("""
+                            UPDATE league_players
+                            SET encounters = encounters + 1,
+                                won = won + ?,
+                                lost = lost + ?
+                            WHERE id = ?
+                        """, (stats["won"], stats["lost"], existing["id"]))
+                    else:
+                        cursor.execute("""
+                            INSERT INTO league_players (league_id, club_name, player_name, encounters, won, lost)
+                            VALUES (?, ?, ?, 1, ?, ?)
+                        """, (team_id, club_name, player_name, stats["won"], stats["lost"]))
+            except Exception as e:
+                print(f"Chyba výsledku predohrávky {match_id}: {e}")
 
         for p_name, p_data in player_totals.items():
             roster_str = ",".join(sorted(list(p_data["rosters"])))

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Keraming Trenčín</title>
+  <link rel="icon" type="image/png" href="/static/img/keraming-logo.png">
   <link rel="stylesheet" href="/static/css/style.css?v={{ asset_version }}">
 </head>
 <body>
@@ -11,7 +12,7 @@
   <header>
     <div class="header-inner">
       <div class="brand" onclick="switchMainTab('competitions')">
-        <img class="brand-logo" src="/static/img/keraming-logo.jpeg" alt="Logo Stolnotenisového klubu Keraming Trenčín">
+        <img class="brand-logo" src="/static/img/keraming-logo.png" alt="Logo Stolnotenisového klubu Keraming Trenčín">
         <div>
           <span class="brand-title">Keraming Trenčín</span>
           <span class="brand-sub">Prepojené so stolnytenis.info</span>
@@ -114,6 +115,7 @@
           <div class="section-title">Správa hráčskych účtov</div>
           <div class="section-sub">Vytvor účty hráčom alebo nastav dočasné heslo pri zabudnutí. Heslo sa zobrazí iba raz.</div>
         </div>
+        <button class="nav-btn" type="button" onclick="resetSignupsNow()">Resetovať prihlásenia na zápasy</button>
       </div>
       <div id="admin-message" class="auth-message hidden" role="status"></div>
       <div id="admin-credential-output" class="credential-output hidden" aria-live="polite"></div>

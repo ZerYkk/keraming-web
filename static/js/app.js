@@ -29,6 +29,7 @@ const ROUTE_TABS = {
 let matches = [];
 let clubPlayers = [];
 let opponentsCache = {};
+let opponentLoadErrors = {};
 let currentUser = null;
 let csrfToken = "";
 let activeTeamId = "A";
@@ -80,6 +81,11 @@ async function loadData() {
 function getCurrentPlayer() {
   if (!currentUser || currentUser.role !== "player" || currentUser.mustChangePassword) return null;
   return clubPlayers.find(p => p.id === currentUser.playerId);
+}
+
+function canViewSignup() {
+  return Boolean(getCurrentPlayer()) ||
+    (currentUser?.role === "admin" && !currentUser.mustChangePassword);
 }
 
 function getTeamName(teamId) {
@@ -235,7 +241,7 @@ async function logout() {
 function updateNavigation() {
   const isPlayer = getCurrentPlayer() !== null;
   const isAdmin = currentUser?.role === "admin" && !currentUser.mustChangePassword;
-  document.getElementById("nav-signup").classList.toggle("hidden", !isPlayer);
+  document.getElementById("nav-signup").classList.toggle("hidden", !canViewSignup());
   document.getElementById("nav-profile").classList.toggle("hidden", !isPlayer);
   document.getElementById("nav-admin").classList.toggle("hidden", !isAdmin);
   document.getElementById("login-open-btn").classList.toggle("hidden", Boolean(currentUser));
@@ -253,7 +259,7 @@ function updateNavigation() {
 }
 
 function switchMainTab(tab, updateUrl = true) {
-  if (tab === "signup" && !getCurrentPlayer()) {
+  if (tab === "signup" && !canViewSignup()) {
     openLogin();
     return;
   }
@@ -283,19 +289,20 @@ window.addEventListener("popstate", (event) => {
 function syncTabFromUrl(updateUrl = false) {
   const path = window.location.pathname;
   let tab = ROUTE_TABS[path] || "competitions";
-  if (tab === "signup" && !getCurrentPlayer()) tab = "competitions";
+  if (tab === "signup" && !canViewSignup()) tab = "competitions";
   if (tab === "admin" && currentUser?.role !== "admin") tab = "competitions";
   switchMainTab(tab, updateUrl);
 }
 
-function selectTeam(teamId) {
+async function selectTeam(teamId) {
   activeTeamId = teamId;
   const first = matches.find(m => m.teamId === teamId);
   expandedMatchId = first ? first.id : null;
-  if (expandedMatchId) {
-    loadOpponents(expandedMatchId);
-  }
   renderAll();
+  if (expandedMatchId) {
+    await loadOpponents(expandedMatchId);
+    renderCompetitions();
+  }
 }
 
 async function toggleMatch(matchId) {
@@ -309,12 +316,15 @@ async function toggleMatch(matchId) {
 }
 
 async function loadOpponents(matchId) {
-  if (opponentsCache[matchId]) return;
+  if (Object.hasOwn(opponentsCache, matchId)) return;
   try {
     const res = await fetch(`/api/matches/${matchId}/opponents`);
+    if (!res.ok) throw new Error(await responseError(res));
     opponentsCache[matchId] = await res.json();
+    delete opponentLoadErrors[matchId];
   } catch (e) {
-    opponentsCache[matchId] = [];
+    opponentLoadErrors[matchId] = e.message;
+    console.error(`Nepodarilo sa načítať úspešnosť súpera pre zápas ${matchId}:`, e);
   }
 }
 
@@ -408,7 +418,9 @@ function renderCompetitions() {
                   <span>Úspešnosť súpera: ${escapeHtml(oppTeam)}</span>
                   <span>Výhry:Prehry (Záp.) • Úsp.</span>
                 </div>
-                ${opps.length > 0 ? opps.map(o => {
+                ${opponentLoadErrors[m.id]
+                  ? `<div style="font-size:12px;color:#dc2626;padding:8px 0;">${escapeHtml(opponentLoadErrors[m.id])}</div>`
+                  : opps.length > 0 ? opps.map(o => {
                   const total = o.won + o.lost;
                   const pct = total > 0 ? Math.round((o.won / total) * 100) : 0;
                   return `
@@ -429,13 +441,15 @@ function renderCompetitions() {
 
 function renderSignupTab() {
   const me = getCurrentPlayer();
-  if (!me) {
+  const isAdminViewer = currentUser?.role === "admin" && !currentUser.mustChangePassword;
+  if (!me && !isAdminViewer) {
     document.getElementById("my-signup-box").innerHTML = "";
     document.getElementById("signup-table-body").innerHTML = "";
     return;
   }
 
-  document.getElementById("my-signup-box").innerHTML = `
+  if (me) {
+    document.getElementById("my-signup-box").innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
       <div>
         <span style="font-size:15px;font-weight:800;">Moja dochádzka na sobotu: ${escapeHtml(me.name)}</span>
@@ -489,10 +503,17 @@ function renderSignupTab() {
       <input type="text" class="note-input" value="${escapeHtml(me.note || '')}" onchange="updateMyNote(this.value)" placeholder="Poznámka (napr. môžem len 1 zápas / beriem 3 ľudí)...">
       <button class="btn-primary" onclick="saveMySignup()">Uložiť moju voľbu</button>
     </div>
-  `;
+    `;
+  } else {
+    document.getElementById("my-signup-box").innerHTML = `
+      <div style="font-size:13px;color:#71717a;">
+        Prehľad prihlásení hráčov (režim iba na čítanie).
+      </div>
+    `;
+  }
 
   document.getElementById("signup-table-body").innerHTML = clubPlayers.map(p => {
-    const isMe = p.id === me.id;
+    const isMe = me && p.id === me.id;
     return `
       <tr class="${isMe ? 'me-row' : ''}">
         <td>
@@ -677,6 +698,11 @@ async function updatePlayerUsername(playerId) {
 async function resetPlayerPassword(playerId) {
   if (!window.confirm("Nastaviť hráčovi nové dočasné heslo? Jeho existujúce prihlásenia sa ukončia.")) return;
   await runAdminAccountAction(`/api/admin/accounts/${playerId}/reset-password`, "POST", {}, "Heslo bolo resetované.");
+}
+
+async function resetSignupsNow() {
+  if (!window.confirm("Naozaj resetovať prihlásenie na zápasy všetkým hráčom?")) return;
+  await runAdminAccountAction("/api/admin/signup/reset", "POST", {}, "Prihlásenia na zápasy boli resetované.");
 }
 
 async function runAdminAccountAction(url, method, body, successMessage) {

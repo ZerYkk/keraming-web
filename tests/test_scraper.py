@@ -89,5 +89,39 @@ class ScraperRosterTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class PreplayedMatchTests(unittest.TestCase):
+    def test_extracts_only_singles_results_from_match_detail(self):
+        soup = scraper.BeautifulSoup("""
+            <div class="mtchv">
+              <div class="mtchv__1">1 . Štvorhra</div>
+              <div class="mtchv__2">
+                <div class="mtchv__player"><a href="/hrac/1">Zeman Martin</a></div>
+                <div class="mtchv__player"><a href="/hrac/2">Hráč Súper</a></div>
+              </div>
+              <div class="mtchv__result">3 : 0</div>
+            </div>
+            <div class="mtchv">
+              <div class="mtchv__1">3 . Dvojhra A-X</div>
+              <div class="mtchv__2">
+                <div class="mtchv__player"><a href="/hrac/1">Zeman Martin</a></div>
+                <div class="mtchv__player"><a href="/hrac/2">Hráč Súper</a></div>
+              </div>
+              <div class="mtchv__result">3 : 0</div>
+            </div>
+        """, "html.parser")
+
+        self.assertEqual(
+            scraper.extract_singles_results(soup),
+            [
+                {"name": "Zeman Martin", "is_home": True, "won": True},
+                {"name": "Hráč Súper", "is_home": False, "won": False}
+            ]
+        )
+
+    def test_future_date_is_identified_for_preplayed_fixture(self):
+        self.assertTrue(scraper.match_date_is_future("28.2.2099 (Ned)"))
+        self.assertFalse(scraper.match_date_is_future("22.11.2020 (Ned)"))
+
+
 if __name__ == "__main__":
     unittest.main()
