@@ -9,6 +9,12 @@ const teams = [
   { id: "H", name: "Ženy", league: "Extraliga", coef: 5 }
 ];
 
+const SATURDAY_TEAM_IDS = new Set(["A", "B", "C", "D", "H"]);
+
+function isSaturdayTeam(teamId) {
+  return SATURDAY_TEAM_IDS.has(teamId);
+}
+
 const TAB_ROUTES = {
   competitions: "/zapasy",
   signup: "/prihlasovanie",
@@ -91,6 +97,92 @@ function canViewSignup() {
 function getTeamName(teamId) {
   const team = teams.find(t => t.id === teamId);
   return team ? team.name : teamId;
+}
+
+function parseMatchDate(match) {
+  const dateMatch = String(match.date || "").match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
+  if (!dateMatch) return null;
+  const [, day, month, year] = dateMatch;
+  return new Date(Number(year), Number(month) - 1, Number(day));
+}
+
+function isSaturdayMatch(match, date) {
+  return Boolean(date) && date.getDay() === 6 &&
+    /\(Sob\)/.test(String(match.date || ""));
+}
+
+function getTeamMatches(teamId) {
+  if (!isSaturdayTeam(teamId)) return [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const teamMatches = matches
+    .filter(match => match.teamId === teamId && match.status === "upcoming")
+    .map(match => ({ match, date: parseMatchDate(match) }))
+    .filter(item => item.date && item.date >= today && isSaturdayMatch(item.match, item.date))
+    .sort((a, b) => a.date - b.date);
+
+  if (teamMatches.length === 0) return [];
+  const nextDate = teamMatches[0].date.getTime();
+  return teamMatches
+    .filter(item => item.date.getTime() === nextDate)
+    .map(item => item.match);
+}
+
+function getMatchOpponent(match) {
+  return match.isHome ? match.away : match.home;
+}
+
+function getMatchTimeMinutes(match) {
+  const timeMatch = String(match.slot || "").match(/(\d{1,2}):(\d{2})/);
+  return timeMatch ? Number(timeMatch[1]) * 60 + Number(timeMatch[2]) : 24 * 60;
+}
+
+function formatTeamMatchDetail(teamId) {
+  const teamMatches = getTeamMatches(teamId);
+  if (teamMatches.length === 0) return "Termín ešte nie je dostupný";
+
+  const date = String(teamMatches[0].date || "")
+    .replace(/\s*\([^)]+\)\s*$/, "")
+    .trim();
+  const morningMatches = teamMatches
+    .filter(match => getMatchTimeMinutes(match) < 14 * 60)
+    .sort((a, b) => getMatchTimeMinutes(a) - getMatchTimeMinutes(b));
+  const afternoonMatches = teamMatches
+    .filter(match => getMatchTimeMinutes(match) >= 14 * 60)
+    .sort((a, b) => getMatchTimeMinutes(a) - getMatchTimeMinutes(b));
+
+  const formatMatch = match => {
+    const venue = match.isHome ? "DOMA" : "VONKU";
+    const time = match.slot && match.slot !== "Čas neurčený" ? match.slot : "čas neurčený";
+    return `${time} · proti ${getMatchOpponent(match)} · ${venue}`;
+  };
+
+  const morning = morningMatches.length
+    ? morningMatches.map(formatMatch).join(" • ")
+    : "žiadny zápas";
+  const afternoon = afternoonMatches.length
+    ? afternoonMatches.map(formatMatch).join(" • ")
+    : "žiadny zápas";
+
+  return `<strong>${escapeHtml(date || "dátum neurčený")}</strong>
+    <span class="signup-match-period"><b>DOOBEDA:</b> ${escapeHtml(morning)}</span>
+    <span class="signup-match-period"><b>POOBEDE:</b> ${escapeHtml(afternoon)}</span>`;
+}
+
+function getSelectedTeamNamesForPeriod(player, period) {
+  if (player.cannotPlay) return [];
+
+  const hasAvailability = period === "morning"
+    ? Boolean(player.canMorning)
+    : Boolean(player.canAfternoon);
+  if (!hasAvailability) return [];
+
+  return (player.selectedLeagues || [])
+    .filter(isSaturdayTeam)
+    .map(teamId => {
+      const team = teams.find(item => item.id === teamId);
+      return team ? team.name : teamId;
+    });
 }
 
 function escapeHtml(value) {
@@ -439,9 +531,71 @@ function renderCompetitions() {
   }).join("");
 }
 
+function getSignupSchedule(teamIds) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const teamIdSet = new Set(teamIds.filter(isSaturdayTeam));
+  const upcoming = matches
+    .filter(match => match.status === "upcoming" && teamIdSet.has(match.teamId))
+    .map(match => ({ match, date: parseMatchDate(match) }))
+    .filter(item => item.date && item.date >= today && isSaturdayMatch(item.match, item.date))
+    .sort((a, b) => a.date - b.date || getMatchTimeMinutes(a.match) - getMatchTimeMinutes(b.match));
+
+  if (upcoming.length === 0) {
+    return `<div class="signup-schedule-empty">Pre tvoje družstvá zatiaľ nie je dostupný najbližší rozpis zápasov.</div>`;
+  }
+
+  const scheduleDate = upcoming[0].date.getTime();
+  const dayMatches = upcoming
+    .filter(item => item.date.getTime() === scheduleDate)
+    .sort((a, b) => getMatchTimeMinutes(a.match) - getMatchTimeMinutes(b.match));
+  const dateLabel = String(dayMatches[0].match.date || "").replace(/\s*\([^)]+\)\s*$/, "").trim();
+  const morningMatches = dayMatches.filter(item => getMatchTimeMinutes(item.match) < 14 * 60);
+  const afternoonMatches = dayMatches.filter(item => getMatchTimeMinutes(item.match) >= 14 * 60);
+
+  const renderMatches = items => items.length > 0
+    ? items.map(({ match }) => {
+        const team = teams.find(t => t.id === match.teamId);
+        const opponent = getMatchOpponent(match);
+        const venue = match.isHome ? "DOMA" : "VONKU";
+        const time = match.slot && match.slot !== "Čas neurčený" ? match.slot : "čas neurčený";
+        return `
+          <div class="signup-schedule-match">
+            <div class="signup-schedule-time">${escapeHtml(time)}</div>
+            <div>
+              <strong>${escapeHtml(team ? team.name : match.teamId)}</strong>
+              <span class="signup-schedule-opponent"> proti ${escapeHtml(opponent)}</span>
+              <span class="signup-schedule-venue ${match.isHome ? "home" : "away"}">${venue}</span>
+            </div>
+          </div>
+        `;
+      }).join("")
+    : `<div class="signup-schedule-empty">Žiadny zápas pre tvoje družstvá.</div>`;
+
+  return `
+    <div class="signup-schedule-title">Najbližší rozpis zápasov – ${escapeHtml(dateLabel)}</div>
+    <div class="signup-schedule-grid">
+      <div class="signup-schedule-column">
+        <div class="signup-schedule-period">DOOBEDA</div>
+        ${renderMatches(morningMatches)}
+      </div>
+      <div class="signup-schedule-column">
+        <div class="signup-schedule-period">POOBEDE</div>
+        ${renderMatches(afternoonMatches)}
+      </div>
+    </div>
+  `;
+}
+
 function renderSignupTab() {
   const me = getCurrentPlayer();
   const isAdminViewer = currentUser?.role === "admin" && !currentUser.mustChangePassword;
+  const scheduleTeamIds = me?.roster || teams.map(team => team.id);
+  const signupSchedule = getSignupSchedule(scheduleTeamIds);
+  const scheduleElement = document.getElementById("signup-schedule");
+  if (scheduleElement) {
+    scheduleElement.innerHTML = signupSchedule;
+  }
   if (!me && !isAdminViewer) {
     document.getElementById("my-signup-box").innerHTML = "";
     document.getElementById("signup-table-body").innerHTML = "";
@@ -462,11 +616,11 @@ function renderSignupTab() {
     <div class="check-pills">
       <div class="check-pill ${me.canMorning && !me.cannotPlay ? 'checked' : ''}" onclick="toggleTimeSlot('morning')">
         <span>${me.canMorning && !me.cannotPlay ? '☑️' : '⬜'}</span>
-        <span>☀️ Sobota DOOBEDA (10:00)</span>
+        <span>Sobota DOOBEDA</span>
       </div>
       <div class="check-pill ${me.canAfternoon && !me.cannotPlay ? 'checked' : ''}" onclick="toggleTimeSlot('afternoon')">
         <span>${me.canAfternoon && !me.cannotPlay ? '☑️' : '⬜'}</span>
-        <span>🌤️ Sobota POOBEDE (14:00+)</span>
+        <span>Sobota POOBEDE</span>
       </div>
       <div class="check-pill ${me.cannotPlay ? 'checked-red' : ''}" onclick="toggleTimeSlot('cannot')">
         <span>${me.cannotPlay ? '🚫' : '⬜'}</span>
@@ -477,6 +631,7 @@ function renderSignupTab() {
     <div class="signup-group-title">2. Ktorú ligu (družstvo) chceš hrať?</div>
     <div class="check-pills">
       ${teams.map(t => {
+        if (!isSaturdayTeam(t.id)) return "";
         const onRoster = me.roster.includes(t.id);
         const isChecked = me.selectedLeagues.includes(t.id) && !me.cannotPlay;
         if (!onRoster) {
@@ -489,7 +644,10 @@ function renderSignupTab() {
         return `
           <div class="check-pill ${isChecked ? 'checked' : ''}" onclick="toggleLeagueChoice('${t.id}')">
             <span>${isChecked ? '☑️' : '⬜'}</span>
-            <span>${t.name} (${t.league})</span>
+            <span>
+              <strong>${t.name} (${t.league})</strong>
+              <span class="signup-match-detail">${formatTeamMatchDetail(t.id)}</span>
+            </span>
           </div>
         `;
       }).join("")}
@@ -514,26 +672,26 @@ function renderSignupTab() {
 
   document.getElementById("signup-table-body").innerHTML = clubPlayers.map(p => {
     const isMe = me && p.id === me.id;
+    const morningTeams = getSelectedTeamNamesForPeriod(p, "morning");
+    const afternoonTeams = getSelectedTeamNamesForPeriod(p, "afternoon");
     return `
       <tr class="${isMe ? 'me-row' : ''}">
         <td>
           <strong>${escapeHtml(p.name)}</strong> ${isMe ? '<span style="font-size:11px;font-weight:700;color:#ca8a04;">(Ty)</span>' : ''}
-          <div style="font-size:11px;color:#71717a;">Súpiska: ${p.roster.map(getTeamName).join(", ")}</div>
         </td>
         <td>
-          ${p.cannotPlay ? '<span class="cannot-badge">✕ Nemôže</span>' : (p.canMorning ? '<span class="yes-badge">✓ Môže doobeda</span>' : '<span class="no-badge">—</span>')}
+          ${p.cannotPlay
+            ? '<span class="cannot-badge">✕ Nemôže</span>'
+            : p.canMorning
+              ? `<span class="yes-badge">✓ Môže doobeda</span>${morningTeams.length ? `<div class="availability-leagues">${morningTeams.map(name => escapeHtml(name)).join(", ")}</div>` : ""}`
+              : '<span class="no-badge">—</span>'}
         </td>
         <td>
-          ${p.cannotPlay ? '<span class="cannot-badge">✕ Nemôže</span>' : (p.canAfternoon ? '<span class="yes-badge">✓ Môže poobede</span>' : '<span class="no-badge">—</span>')}
-        </td>
-        <td>
-          ${p.selectedLeagues.length > 0 && !p.cannotPlay
-            ? p.selectedLeagues.map(lg => {
-                const t = teams.find(x => x.id === lg);
-                return `<span class="league-badge">${t ? t.name + ' (' + t.league + ')' : lg}</span>`;
-              }).join("")
-            : '<span style="color:#a1a1aa;font-size:12px;">Žiadna zvolená</span>'
-          }
+          ${p.cannotPlay
+            ? '<span class="cannot-badge">✕ Nemôže</span>'
+            : p.canAfternoon
+              ? `<span class="yes-badge">✓ Môže poobede</span>${afternoonTeams.length ? `<div class="availability-leagues">${afternoonTeams.map(name => escapeHtml(name)).join(", ")}</div>` : ""}`
+              : '<span class="no-badge">—</span>'}
         </td>
         <td>
           ${p.takesCar && !p.cannotPlay ? '<span style="font-size:12px;font-weight:700;color:#1d4ed8;">🚗 Auto</span> ' : ''}
@@ -566,7 +724,7 @@ function toggleTimeSlot(slot) {
 
 function toggleLeagueChoice(teamId) {
   const me = getCurrentPlayer();
-  if (!me || !me.roster.includes(teamId)) return;
+  if (!me || !isSaturdayTeam(teamId) || !me.roster.includes(teamId)) return;
   me.cannotPlay = false;
   if (me.selectedLeagues.includes(teamId)) {
     me.selectedLeagues = me.selectedLeagues.filter(x => x !== teamId);

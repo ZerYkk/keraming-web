@@ -868,7 +868,11 @@ def update_signup(data: SignupPayload, request: Request):
         raise HTTPException(status_code=404, detail="Hráč neexistuje")
 
     allowed_roster = [x.strip() for x in player["roster"].split(",") if x.strip()]
-    valid_leagues = [lg for lg in data.selectedLeagues if lg in allowed_roster]
+    saturday_team_ids = {"A", "B", "C", "D", "H"}
+    valid_leagues = [
+        lg for lg in data.selectedLeagues
+        if lg in allowed_roster and lg in saturday_team_ids
+    ]
 
     conn.execute("""
         UPDATE players

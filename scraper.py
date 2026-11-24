@@ -321,6 +321,13 @@ def sync_from_stolnytenis(db_file: str):
                             INSERT INTO matches (external_id, team_id, round, match_date, slot, home_team, away_team, is_home, status, score)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(external_id) DO UPDATE SET
+                                team_id=excluded.team_id,
+                                round=excluded.round,
+                                match_date=excluded.match_date,
+                                slot=excluded.slot,
+                                home_team=excluded.home_team,
+                                away_team=excluded.away_team,
+                                is_home=excluded.is_home,
                                 status=excluded.status,
                                 score=excluded.score
                         """, (
